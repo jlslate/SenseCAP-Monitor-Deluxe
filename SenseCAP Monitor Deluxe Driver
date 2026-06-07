@@ -4,1056 +4,1432 @@
  */
 
 /**
- * SenseCAP Auto-Pages App v5.1.0
+ * SenseCAP Auto-Pages Driver v5.1.0
  *
- * Hubitat app companion to SenseCAP Auto-Pages Driver.
- * Manages up to 6 display pages on the SenseCAP Indicator D1 via openHASP/MQTT.
+ * Hubitat driver for the SenseCAP Indicator D1 (480x480) running openHASP firmware.
+ * Communicates via MQTT. Up to 6 pages, each with a user-selected sensor type and
+ * auto-sized grid layout.
  *
  * Key features:
- * - Up to 6 pages, each with independent sensor type and device selection
- * - Page type can be "mixed" -- each slot picks its own sensor type + device
- * - Slot labels can be overridden per-slot (single-type and mixed pages)
- * - Supported types: smoke / motion / water / contact / light (switch)
- * - Grid auto-sized 1x1 to 7x7 based on device count
- * - Page display order adjustable via Move Up / Move Down buttons
- * - Remove button on each page (except first) to delete pages
- * - Add Page toggle appears at bottom of last page section
- * - Devices sorted alphabetically (emoji-stripped) within each page
- * - Light pages: tap-to-toggle via MQTT button events; periodic re-sync (configurable)
- * - Sensor events gated during layout push via appPushInProgress state flag
- * - syncAllSensors fires after returnToPage1 so all states correct after render
- * - On save/reboot: rebootDisplay sent if MQTT connected, LWT triggers re-push
- * - getPageOrder() for UI (all pages); activePageOrder() for driver operations
+ * - Up to 6 pages: smoke / motion / water / contact / light (switch) / mixed
+ * - Grid auto-sized from 1x1 to 7x7 based on device count
+ * - Pages render sequentially -- each page fully built before showing
+ * - Per-page drain timer (navigatePage1..6) waits for openHASP queue to clear
+ *   before flipping to the rendered page, eliminating partial-render flashes
+ * - Light tiles: tap-to-toggle via openHASP button events; full btn jsonl
+ *   rebuild on every state change so color + label + click:true arrive atomically
+ * - pushInProgress attribute + appPushInProgress app state gate all sensor
+ *   event handlers and syncAllSensors during layout push
+ * - Page order adjustable via Move Up / Move Down buttons in app UI
+ * - Rotation auto-starts after all pages rendered and page 1 is shown
+ * - rebootDisplay command sends openHASP reboot via MQTT
+ * - Backlight and idle management
+ * - safePub() wraps all MQTT publishes -- auto-reconnects on "not connected" errors
+ * - applyLabels() pushes labels live to display immediately (not just at layout time)
+ * - buildLightTileJsonl() uses grid-matched text_font so bulb matches other icons
  *
  * Author: jlslate (slate)
- * Version: 5.2.0
+ * Version: 5.1.0
  */
 
-definition(
-    name: "SenseCAP Auto-Pages Monitor",
-    namespace: "jlslate",
-    author: "jlslate (slate)",
-    description: "Auto-assigns sensors to pages by type on a SenseCAP Indicator display via MQTT",
-    category: "Integration",
-    iconUrl: "",
-    iconX2Url: ""
-)
+import groovy.transform.Field
 
-preferences {
-    page(name: "mainPage")
-}
+metadata {
+    definition(
+        name: "SenseCAP Auto-Pages Monitor",
+        namespace: "jlslate",
+        author: "jlslate (slate)",
+        description: "Auto-paged sensor monitor -- Smoke/Motion/Water/Contact each get their own page"
+    ) {
+        capability "Initialize"
+        capability "Actuator"
 
-// ── UI ────────────────────────────────────────────────────────────────────────
+        command "reconnectMqtt"
+        command "rebootDisplay"
+        command "pushAllLayouts", [[name:"numberOfPages", type:"NUMBER"]]
+        command "setNumberOfPages", [[name:"n", type:"NUMBER"]]
 
-def mainPage() {
-    dynamicPage(name: "mainPage", title: "SenseCAP Auto-Pages Monitor", install: true, uninstall: true) {
+        command "setPage1GridLayout", [[name:"g", type:"STRING"]]
+        command "setPage2GridLayout", [[name:"g", type:"STRING"]]
+        command "setPage3GridLayout", [[name:"g", type:"STRING"]]
+        command "setPage4GridLayout", [[name:"g", type:"STRING"]]
+        command "setPage5GridLayout", [[name:"g", type:"STRING"]]
+        command "setPage6GridLayout", [[name:"g", type:"STRING"]]
 
-        section("<b>App Name</b>") {
-            label title: "Rename this app (optional)", required: false
+        command "setPage1MotionActive",   [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage1MotionInactive", [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage1SlotEmpty",      [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage2MotionActive",   [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage2MotionInactive", [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage2SlotEmpty",      [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage3MotionActive",   [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage3MotionInactive", [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage3SlotEmpty",      [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage4MotionActive",   [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage4MotionInactive", [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage4SlotEmpty",      [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage5MotionActive",   [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage5MotionInactive", [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage5SlotEmpty",      [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage6MotionActive",   [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage6MotionInactive", [[name:"sensorIndex", type:"NUMBER"]]
+        command "setPage6SlotEmpty",      [[name:"sensorIndex", type:"NUMBER"]]
+
+        command "updatePage1Labels",    [[name:"labels",    type:"JSON_OBJECT"]]
+        command "updatePage2Labels",    [[name:"labels",    type:"JSON_OBJECT"]]
+        command "updatePage3Labels",    [[name:"labels",    type:"JSON_OBJECT"]]
+        command "updatePage4Labels",    [[name:"labels",    type:"JSON_OBJECT"]]
+        command "updatePage5Labels",    [[name:"labels",    type:"JSON_OBJECT"]]
+        command "updatePage6Labels",    [[name:"labels",    type:"JSON_OBJECT"]]
+        command "updatePage1SlotTypes", [[name:"slotTypes", type:"JSON_OBJECT"]]
+        command "updatePage2SlotTypes", [[name:"slotTypes", type:"JSON_OBJECT"]]
+        command "updatePage3SlotTypes", [[name:"slotTypes", type:"JSON_OBJECT"]]
+        command "updatePage4SlotTypes", [[name:"slotTypes", type:"JSON_OBJECT"]]
+        command "updatePage5SlotTypes", [[name:"slotTypes", type:"JSON_OBJECT"]]
+        command "updatePage6SlotTypes", [[name:"slotTypes", type:"JSON_OBJECT"]]
+
+        // Thermostat commands (one set per page -- app calls these directly)
+        (1..6).each { pg ->
+            command "pushThermostatPage",         [[name:"page", type:"NUMBER"], [name:"data", type:"JSON_OBJECT"]]
+            command "updateThermostatDisplay",    [[name:"page", type:"NUMBER"], [name:"data", type:"JSON_OBJECT"]]
         }
+        attribute "thermostatTapped", "string"
 
-        section("<b>SenseCAP Indicator Device</b>") {
-            input name: "indicatorDevice",
-                  type: "capability.actuator",
-                  title: "Select your SenseCAP Auto-Pages device",
-                  required: true,
-                  multiple: false
-        }
+        // Register thermostat device so driver can handle taps directly
+        command "setPage1ThermostatDevice", [[name:"deviceId", type:"STRING"]]
+        command "setPage2ThermostatDevice", [[name:"deviceId", type:"STRING"]]
+        command "setPage3ThermostatDevice", [[name:"deviceId", type:"STRING"]]
+        command "setPage4ThermostatDevice", [[name:"deviceId", type:"STRING"]]
+        command "setPage5ThermostatDevice", [[name:"deviceId", type:"STRING"]]
+        command "setPage6ThermostatDevice", [[name:"deviceId", type:"STRING"]]
 
-        List<Integer> ord = getPageOrder()
-        int totalPages = numberOfPages()
+        attribute "mqttStatus",        "string"
+        attribute "displayRebooted",   "string"
+        attribute "layoutPushComplete","string"
+        attribute "pushInProgress",    "string"
+        attribute "lightTapped",       "string"
 
-        // Pages -- shown in current display order with inline move buttons
-        ord.eachWithIndex { srcPage, dispIdx ->
-            int dispPos = dispIdx + 1
-            boolean canUp = (dispPos > 1)
-            boolean canDn = (dispPos < ord.size())
-
-            if (srcPage == 1 ||
-                (srcPage == 2 && settings.addPage2) ||
-                (srcPage == 3 && settings.addPage2 && settings.addPage3) ||
-                (srcPage == 4 && settings.addPage2 && settings.addPage3 && settings.addPage4) ||
-                (srcPage == 5 && settings.addPage2 && settings.addPage3 && settings.addPage4 && settings.addPage5) ||
-                (srcPage == 6 && settings.addPage2 && settings.addPage3 && settings.addPage4 && settings.addPage5 && settings.addPage6)) {
-
-                section("<b>Page ${dispPos}</b>") {
-                    input name: "page${srcPage}Type",
-                          type: "enum",
-                          title: "Page type",
-                          options: pageTypeOptions(),
-                          required: false,
-                          defaultValue: null,
-                          submitOnChange: true,
-                          width: 6
-
-                    if (canUp) {
-                        input name: "moveUp_${dispPos}",
-                              type: "button",
-                              title: "&#9650; Move Up",
-                              width: canDn ? 2 : 3
-                    }
-                    if (canDn) {
-                        input name: "moveDn_${dispPos}",
-                              type: "button",
-                              title: "&#9660; Move Down",
-                              width: canUp ? 2 : 3
-                    }
-                    if (dispPos > 1) {
-                        input name: "deletePage_${srcPage}",
-                              type: "button",
-                              title: "&#10006; Remove",
-                              width: 2
-                    }
-
-                    String pType = settings["page${srcPage}Type"] ?: ""
-
-                    if (pType == "mixed") {
-                        renderMixedPageInputs(srcPage)
-                    } else if (pType == "thermostat") {
-                        input name: "page${srcPage}ThermostatDevice",
-                              type: "capability.thermostat",
-                              title: "Select thermostat",
-                              required: false,
-                              multiple: false,
-                              submitOnChange: true
-                        paragraph "Fixed 3x2 layout: main display + H&#x25B2; H&#x25BC; C&#x25B2; C&#x25BC; Mode"
-                    } else if (pType) {
-                        String devInputName = "page${srcPage}Devices_${pType}"
-                        input name: devInputName,
-                              type: capabilityFor(pType),
-                              title: "Select devices",
-                              required: false,
-                              multiple: true,
-                              submitOnChange: true
-                        List selDevs = settings[devInputName] ?: []
-                        int cnt = selDevs.size()
-                        int n = gridSizeFor(cnt)
-                        paragraph "Devices: <b>${cnt}</b> &rarr; Grid: <b>${n}x${n}</b>"
-                        if (cnt > 0) {
-                            input name: "page${srcPage}RenameSlots",
-                                  type: "bool",
-                                  title: "Rename slots",
-                                  defaultValue: false,
-                                  submitOnChange: true
-                            if (settings["page${srcPage}RenameSlots"]) {
-                                List sortedDevs = sortDevicesByName(selDevs)
-                                sortedDevs.eachWithIndex { dev, idx ->
-                                    if (!dev) return
-                                    int slot = idx + 1
-                                    String hint = stripEmoji(dev.displayName ?: "")
-                                    input name: "page${srcPage}SlotLabel${slot}",
-                                          type: "text",
-                                          title: "Slot ${slot} label (default: ${hint})",
-                                          required: false,
-                                          defaultValue: ""
-                                }
-                            }
-                        }
-                    }
-
-                    // Add-page toggle at the last displayed page
-                    int activePages = ord.size()
-                    boolean isLastDisplayed = (dispPos == activePages)
-                    if (isLastDisplayed && activePages < 6) {
-                        switch (activePages) {
-                            case 1: input name: "addPage2", type: "bool", title: "Add page 2", defaultValue: false, submitOnChange: true; break
-                            case 2: input name: "addPage3", type: "bool", title: "Add page 3", defaultValue: false, submitOnChange: true; break
-                            case 3: input name: "addPage4", type: "bool", title: "Add page 4", defaultValue: false, submitOnChange: true; break
-                            case 4: input name: "addPage5", type: "bool", title: "Add page 5", defaultValue: false, submitOnChange: true; break
-                            case 5: input name: "addPage6", type: "bool", title: "Add page 6", defaultValue: false, submitOnChange: true; break
-                        }
-                    }
-                }
-            }
-        }
-
-        section("<b>Options</b>") {
-            input name: "syncOnStartup",
-                  type: "bool",
-                  title: "Sync all sensor states on startup/save",
-                  defaultValue: true
-            input name: "lightSyncInterval",
-                  type: "enum",
-                  title: "Re-sync light states every",
-                  options: ["0":"Never","5":"5 minutes","10":"10 minutes","30":"30 minutes"],
-                  defaultValue: "10"
-            input name: "logLevel",
-                  type: "enum",
-                  title: "Logging Level",
-                  options: ["0":"None","1":"Info only","2":"Info + Debug"],
-                  defaultValue: "1",
-                  required: true
-        }
-
-        section("<b>Status</b>") {
-            int total = activePageOrder().size()
-            int devices = activePageOrder().sum { pg -> pageDeviceCount(pg) } as int
-            paragraph "Pages: <b>${total}</b> -- Total devices: <b>${devices}</b>"
-            if (settings.indicatorDevice) {
-                paragraph "MQTT status: <b>${settings.indicatorDevice.currentValue('mqttStatus') ?: 'unknown'}</b>"
-            }
-        }
-    }
-}
-
-// Render per-slot inputs for a mixed page.
-// The user picks a grid size first, then gets one type+device row per slot.
-private void renderMixedPageInputs(int srcPage) {
-    input name: "page${srcPage}MixedGrid",
-          type: "enum",
-          title: "Grid size (slots)",
-          options: mixedGridOptions(),
-          required: false,
-          defaultValue: "1",
-          submitOnChange: true
-
-    String gridSel = settings["page${srcPage}MixedGrid"] ?: "1"
-    int gridN = gridSel as int
-    int totalSlots = gridN * gridN
-
-    paragraph "Grid: <b>${gridN}x${gridN}</b> (${totalSlots} slots)"
-
-    (1..totalSlots).each { slot ->
-        String typeKey = "page${srcPage}MixedSlot${slot}Type"
-        String slotType = settings[typeKey] ?: ""
-
-        input name: typeKey,
-              type: "enum",
-              title: "Slot ${slot} type",
-              options: sensorTypeOptions(),
-              required: false,
-              defaultValue: null,
-              submitOnChange: true,
-              width: 4
-
-        if (slotType) {
-            String devKey = "page${srcPage}MixedSlot${slot}Device_${slotType}"
-            def slotDev = settings[devKey]
-            input name: devKey,
-                  type: capabilityFor(slotType),
-                  title: "Slot ${slot} device",
-                  required: false,
-                  multiple: false,
-                  submitOnChange: true,
-                  width: slotDev ? 5 : 8
-            if (slotDev) {
-                String hint = stripEmoji(slotDev.displayName ?: "")
-                input name: "page${srcPage}MixedSlot${slot}Label",
-                      type: "text",
-                      title: "Slot ${slot} label (default: ${hint})",
-                      required: false,
-                      defaultValue: "",
-                      width: 3
-            }
-        }
-    }
-}
-
-// ── Option maps ───────────────────────────────────────────────────────────────
-
-private Map pageTypeOptions() {
-    ["smoke":"Smoke detectors",
-     "motion":"Motion sensors",
-     "water":"Water sensors",
-     "contact":"Contact sensors",
-     "light":"Lights (switch)",
-     "thermostat":"Thermostat",
-     "mixed":"Mixed (any sensor per slot)"]
-}
-
-private Map sensorTypeOptions() {
-    ["smoke":"Smoke",
-     "motion":"Motion",
-     "water":"Water",
-     "contact":"Contact",
-     "light":"Light (switch)"]
-}
-
-private Map mixedGridOptions() {
-    ["1":"1x1 (1 slot)",
-     "2":"2x2 (4 slots)",
-     "3":"3x3 (9 slots)",
-     "4":"4x4 (16 slots)",
-     "5":"5x5 (25 slots)",
-     "6":"6x6 (36 slots)",
-     "7":"7x7 (49 slots)"]
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-private String capabilityFor(String sType) {
-    switch (sType) {
-        case "smoke":   return "capability.smokeDetector"
-        case "motion":  return "capability.motionSensor"
-        case "water":   return "capability.waterSensor"
-        case "contact": return "capability.contactSensor"
-        case "light":       return "capability.switch"
-        case "thermostat":  return "capability.thermostat"
-        default:            return "capability.sensor"
-    }
-}
-
-private String attributeFor(String sType) {
-    switch (sType) {
-        case "smoke":   return "smoke"
-        case "motion":  return "motion"
-        case "water":   return "water"
-        case "contact": return "contact"
-        case "light":   return "switch"
-        default:        return "motion"
-    }
-}
-
-private String activeValueFor(String sType) {
-    switch (sType) {
-        case "smoke":   return "detected"
-        case "motion":  return "active"
-        case "water":   return "wet"
-        case "contact": return "open"
-        case "light":   return "on"
-        default:        return "active"
-    }
-}
-
-private int numberOfPages() {
-    if (!settings.addPage2) return 1
-    if (!settings.addPage3) return 2
-    if (!settings.addPage4) return 3
-    if (!settings.addPage5) return 4
-    if (!settings.addPage6) return 5
-    return 6
-}
-
-// Returns the flat ordered device list for a page (for non-mixed pages).
-private List pageDevices(int page) {
-    String sType = settings["page${page}Type"] ?: ""
-    if (!sType || sType == "mixed") return []
-    return (settings["page${page}Devices_${sType}"] ?: []) as List
-}
-
-// Returns total device count for a page (works for both mixed and single-type).
-private int pageDeviceCount(int page) {
-    String pType = settings["page${page}Type"] ?: ""
-    if (pType == "mixed") {
-        int gridN = (settings["page${page}MixedGrid"] ?: "1") as int
-        int count = 0
-        (1..gridN * gridN).each { slot ->
-            String slotType = settings["page${page}MixedSlot${slot}Type"] ?: ""
-            if (slotType) {
-                def dev = settings["page${page}MixedSlot${slot}Device_${slotType}"]
-                if (dev) count++
-            }
-        }
-        return count
-    }
-    if (pType == "thermostat") return settings["page${page}ThermostatDevice"] ? 1 : 0
-    return pageDevices(page)?.size() ?: 0
-}
-
-private String pageType(int page) {
-    return (settings["page${page}Type"] ?: "motion") as String
-}
-
-// Build a slot map: deviceId -> slotNumber (1-based).
-// For mixed pages, slot numbers match the grid slot indices directly.
-private Map buildSlotMap(int page, List devices, String sType) {
-    Map m = [:]
-    if (sType == "mixed") {
-        int gridN = (settings["page${page}MixedGrid"] ?: "1") as int
-        (1..gridN * gridN).each { slot ->
-            String slotType = settings["page${page}MixedSlot${slot}Type"] ?: ""
-            if (slotType) {
-                def dev = settings["page${page}MixedSlot${slot}Device_${slotType}"]
-                if (dev) m[dev.id.toString()] = slot
-            }
-        }
-    } else {
-        devices.eachWithIndex { dev, idx ->
-            if (dev) m[dev.id.toString()] = idx + 1
-        }
-    }
-    return m
-}
-
-// Returns a List of [slot, sType, dev] triples for a page (all types combined).
-// Used for sync and subscription -- works for both mixed and single-type pages.
-private List<Map> pageSlotEntries(int page) {
-    String pType = settings["page${page}Type"] ?: ""
-    List<Map> entries = []
-    if (pType == "mixed") {
-        int gridN = (settings["page${page}MixedGrid"] ?: "1") as int
-        (1..gridN * gridN).each { slot ->
-            String slotType = settings["page${page}MixedSlot${slot}Type"] ?: ""
-            if (slotType) {
-                def dev = settings["page${page}MixedSlot${slot}Device_${slotType}"]
-                if (dev) entries << [slot: slot, sType: slotType, dev: dev]
-            }
-        }
-    } else if (pType) {
-        List devs = sortDevicesByName(pageDevices(page))
-        devs.eachWithIndex { dev, idx ->
-            if (dev) entries << [slot: idx + 1, sType: pType, dev: dev]
-        }
-    }
-    return entries
-}
-
-private List<Integer> getPageOrder() {
-    int total = numberOfPages()
-    List stored = state.pageOrder ?: []
-    List<Integer> order = stored.findAll { it >= 1 && it <= total }.collect { it as int }
-    (1..total).each { pg -> if (!order.contains(pg)) order << pg }
-    return order
-}
-
-private List<Integer> activePageOrder() {
-    return getPageOrder()
-}
-
-// ── Button handler ────────────────────────────────────────────────────────────
-
-def appButtonHandler(String buttonName) {
-    List<Integer> order = getPageOrder()
-    boolean changed = false
-
-    if (buttonName.startsWith("deletePage_")) {
-        int srcPage = buttonName.replace("deletePage_", "").toInteger()
-        int total = numberOfPages()
-
-        for (int i = srcPage; i < total; i++) {
-            int next = i + 1
-            String nextType = settings["page${next}Type"] ?: ""
-            if (nextType) {
-                app.updateSetting("page${i}Type", [value: nextType, type: "enum"])
-            } else {
-                app.clearSetting("page${i}Type")
-            }
-            // Copy mixed grid setting if applicable
-            if (nextType == "mixed") {
-                String ng = settings["page${next}MixedGrid"] ?: "1"
-                app.updateSetting("page${i}MixedGrid", [value: ng, type: "enum"])
-            } else {
-                app.clearSetting("page${i}MixedGrid")
-            }
-            state["prevType${i}"] = nextType
-        }
-
-        app.clearSetting("page${total}Type")
-        app.clearSetting("page${total}Devices")
-        app.clearSetting("page${total}MixedGrid")
-        state["prevType${total}"] = ""
-
-        switch (total) {
-            case 2: app.updateSetting("addPage2", [value: false, type: "bool"]); break
-            case 3: app.updateSetting("addPage3", [value: false, type: "bool"]); break
-            case 4: app.updateSetting("addPage4", [value: false, type: "bool"]); break
-            case 5: app.updateSetting("addPage5", [value: false, type: "bool"]); break
-            case 6: app.updateSetting("addPage6", [value: false, type: "bool"]); break
-        }
-
-        state.pageOrder = null
-        infoLog "[AutoPages] Deleted page at position ${srcPage}, shifted pages down, new total ${total - 1}"
-        return
-    }
-
-    if (buttonName.startsWith("moveUp_")) {
-        int pos = buttonName.replace("moveUp_", "").toInteger()
-        if (pos > 1 && pos <= order.size()) {
-            int tmp = order[pos - 2]
-            order[pos - 2] = order[pos - 1]
-            order[pos - 1] = tmp
-            changed = true
-        }
-    } else if (buttonName.startsWith("moveDn_")) {
-        int pos = buttonName.replace("moveDn_", "").toInteger()
-        if (pos >= 1 && pos < order.size()) {
-            int tmp = order[pos - 1]
-            order[pos - 1] = order[pos]
-            order[pos] = tmp
-            changed = true
+        (1..6).each { pg ->
+            attribute "page${pg}GridLayout", "string"
         }
     }
 
-    if (changed) {
-        state.pageOrder = order
-        infoLog "[AutoPages] Page order: ${order.collect { pageType(it) }.join(' -> ')}"
+    preferences {
+        input name: "mqttBroker",   type: "text",     title: "<b>MQTT Broker</b> (host:port)", required: true, defaultValue: "tcp://127.0.0.1:1883"
+        input name: "mqttPassword", type: "password", title: "MQTT Password", required: true,
+              description: "Found in Hubitat -> Integrations -> MQTT Broker"
+        input name: "mqttClientId", type: "text",     title: "MQTT Client ID", required: true, defaultValue: "hubitat-sensecap-autopages"
+        input name: "haspNode",     type: "text",     title: "<b>openHASP Node Name</b>", required: true, defaultValue: "plate"
+
+        input name: "colorActive",        type: "enum", title: "<b>Active color</b>",     options: activeColorOptions(), defaultValue: "#FF0000", required: true
+        input name: "colorInactive",      type: "enum", title: "Inactive -- Motion",       options: colorOptions(),       defaultValue: "#008000", required: true
+        input name: "colorContactInactive",type:"enum", title: "Inactive -- Contact",      options: colorOptions(),       defaultValue: "#00FFFF", required: true
+        input name: "colorWaterInactive", type: "enum", title: "Inactive -- Water",        options: colorOptions(),       defaultValue: "#0000FF", required: true
+        input name: "colorSmokeInactive", type: "enum", title: "Inactive -- Smoke",        options: colorOptions(),       defaultValue: "#808080", required: true
+        input name: "colorLightInactive", type: "enum", title: "Inactive -- Light off",    options: colorOptions(),       defaultValue: "#808080", required: true
+        input name: "colorLightActive",   type: "enum", title: "Active -- Light on",       options: colorOptions(),       defaultValue: "#FFFF00", required: true
+
+        input name: "colorThermostatHeating", type: "enum", title: "Thermostat -- Heating",     options: colorOptions(), defaultValue: "#FF6600", required: true
+        input name: "colorThermostatCooling", type: "enum", title: "Thermostat -- Cooling",     options: colorOptions(), defaultValue: "#0088FF", required: true
+        input name: "colorThermostatIdle",    type: "enum", title: "Thermostat -- Idle",        options: colorOptions(), defaultValue: "#606060", required: true
+        input name: "colorThermostatOff",     type: "enum", title: "Thermostat -- Off",         options: colorOptions(), defaultValue: "#303030", required: true
+        input name: "colorThermostatFan",     type: "enum", title: "Thermostat -- Fan only",    options: colorOptions(), defaultValue: "#008080", required: true
+
+        input name: "fadeDuration",           type: "number", title: "Fade duration (seconds)",                                              defaultValue: 30,  required: true
+        input name: "showPageIndicator",      type: "bool",   title: "Show page indicator (e.g. 1/4)",                                      defaultValue: true
+        input name: "rotationInterval",       type: "number", title: "Auto-scroll pages every (seconds, 0 = off)",                          defaultValue: 10
+        input name: "backlightOnMotion",      type: "bool",   title: "<b>Backlight ON</b> when sensor active",                              defaultValue: true
+        input name: "backlightOffDelay",      type: "number", title: "Backlight OFF after all clear (seconds, 0=never)",                    defaultValue: 0
+        input name: "motionBacklightTimeout", type: "number", title: "Backlight OFF after active for (minutes, 0=never)",                   defaultValue: 1
+        input name: "touchBacklightTimeout",  type: "number", title: "Backlight OFF after screen tap (seconds, 0=never)",                   defaultValue: 30
+        input name: "logLevel",               type: "enum",   title: "Logging Level",
+              options: ["0":"None","1":"Info only","2":"Info + Debug"], defaultValue: "1", required: true
+
+        // Thermostat devices -- one per page, set automatically by the app
+        input name: "thermostatPage1", type: "capability.thermostat", title: "Thermostat -- Page 1", required: false, multiple: false
+        input name: "thermostatPage2", type: "capability.thermostat", title: "Thermostat -- Page 2", required: false, multiple: false
+        input name: "thermostatPage3", type: "capability.thermostat", title: "Thermostat -- Page 3", required: false, multiple: false
+        input name: "thermostatPage4", type: "capability.thermostat", title: "Thermostat -- Page 4", required: false, multiple: false
+        input name: "thermostatPage5", type: "capability.thermostat", title: "Thermostat -- Page 5", required: false, multiple: false
+        input name: "thermostatPage6", type: "capability.thermostat", title: "Thermostat -- Page 6", required: false, multiple: false
     }
 }
 
-// ── Lifecycle ─────────────────────────────────────────────────────────────────
+private Map activeColorOptions() {
+    ["#FF0000":"Red","#FF4500":"Orange-red","#FF8C00":"Dark orange","#FF1493":"Deep pink",
+     "#8B0000":"Dark red","#FF6347":"Tomato","#DC143C":"Crimson","#FF0080":"Hot magenta"]
+}
+
+private Map colorOptions() {
+    ["#F8F8FF":"Ghost White","#D3D3D3":"Light Gray","#808080":"Gray","#800000":"Maroon",
+     "#FF00FF":"Magenta","#800080":"Purple","#0000FF":"Blue","#000080":"Navy","#00FFFF":"Cyan",
+     "#008080":"Teal","#00FF00":"Lime","#008000":"Green","#FFFF00":"Yellow","#808000":"Olive"]
+}
+
+// ── Object ID helpers ──────────────────────────────────────────────────────────
+
+private int bgId(int slot)   { slot }
+private int iconId(int slot) { slot + 50 }
+
+// ── State key helpers ──────────────────────────────────────────────────────────
+
+private String stateKey(int page, int idx) { "p${page}sensor${idx}" }
+private String typeKey(int page, int idx)  { "p${page}slotType${idx}" }
+private String labelKey(int page, int idx) { "p${page}label${idx}" }
+
+// ── Lifecycle ──────────────────────────────────────────────────────────────────
 
 def installed() {
-    infoLog "[AutoPages] App installed"
+    infoLog "[AutoPages] Driver installed"
     initialize()
 }
 
 def updated() {
-    infoLog "[AutoPages] App updated"
-    unsubscribe()
+    infoLog "[AutoPages] Preferences updated"
     initialize()
 }
 
-def uninstalled() {
-    unsubscribe()
-}
-
 def initialize() {
-    if (!settings.indicatorDevice) {
-        infoLog "[AutoPages] No indicator device selected"
+    String mqttSt = device.currentValue("mqttStatus") ?: ""
+    if (!mqttSt.startsWith("Connected")) {
+        connectMqtt()
+    } else {
+        infoLog "[AutoPages] MQTT already connected -- skipping reconnect"
+    }
+    unschedule("sendHeartbeat")
+    runEvery1Minute("sendHeartbeat")
+}
+
+def uninstalled() { disconnectMqtt() }
+
+// ── Grid config ────────────────────────────────────────────────────────────────
+
+def setNumberOfPages(n) {
+    int num = Math.min(6, Math.max(1, (n as int)))
+    state.numberOfPages = num
+    infoLog "[AutoPages] Number of pages set to ${num}"
+}
+
+def setPage1GridLayout(String g) { applyGridLayout(1, g) }
+def setPage2GridLayout(String g) { applyGridLayout(2, g) }
+def setPage3GridLayout(String g) { applyGridLayout(3, g) }
+def setPage4GridLayout(String g) { applyGridLayout(4, g) }
+def setPage5GridLayout(String g) { applyGridLayout(5, g) }
+def setPage6GridLayout(String g) { applyGridLayout(6, g) }
+
+private void applyGridLayout(int page, String g) {
+    state["page${page}GridLayout"] = g
+    state["page${page}MaxSlots"] = maxSlotsForGrid(g)
+    sendEvent(name: "page${page}GridLayout", value: g)
+    infoLog "[AutoPages] Page ${page} grid -> ${g}"
+    (1..49).each { s -> state.remove("p${page}label${s}") }
+}
+
+private int maxSlotsForGrid(String g) {
+    switch (g) {
+        case "thermostat": return 4
+        case "1x1": return 1
+        case "3x3": return 9
+        case "4x4": return 16
+        case "5x5": return 25
+        case "6x6": return 36
+        case "7x7": return 49
+        default:    return 4   // 2x2
+    }
+}
+
+private String activeGrid(int page) {
+    return (state["page${page}GridLayout"] ?: "2x2") as String
+}
+
+private int maxSensors(int page) {
+    int stored = (state["page${page}MaxSlots"] ?: 0) as int
+    if (stored > 0) return stored
+    return maxSlotsForGrid(activeGrid(page))
+}
+
+// Returns the text_font integer the layout uses for btn tiles on a given grid.
+// All icon overlays and light tile rebuilds must use the same value.
+private int tileFontFor(String grid) {
+    switch (grid) {
+        case "thermostat": return 24
+        case "1x1": return 32
+        case "2x2": return 32
+        case "3x3": return 24
+        case "4x4": return 16
+        case "5x5": return 12
+        case "6x6": return 12
+        case "7x7": return 12
+        default:    return 16
+    }
+}
+
+// ── MQTT -- safe wrapper ───────────────────────────────────────────────────────
+
+// All MQTT publishes go through safePub.
+// On failure, swallow silently. mqttClientStatus fires exactly once when the
+// broker drops and handles reconnect. Any sendEvent or runIn here floods the
+// log and prevents the reconnect timer from ever firing.
+private void safePub(String topic, String payload, int qos = 1, boolean retained = false) {
+    try {
+        interfaces.mqtt.publish(topic, payload, qos, retained)
+    } catch (Exception e) {
+        // Silent -- mqttClientStatus handles reconnect
+    }
+}
+
+def connectMqtt() {
+    if (!settings.mqttPassword) { infoLog "[AutoPages] MQTT password not set"; return }
+    try {
+        String broker   = settings.mqttBroker   ?: "tcp://127.0.0.1:1883"
+        String baseId   = settings.mqttClientId ?: "hubitat-sensecap-autopages"
+        String clientId = baseId + "-" + device.id
+        interfaces.mqtt.connect(broker, clientId, "hubitat", settings.mqttPassword)
+        infoLog "[AutoPages] MQTT connected -> ${broker}"
+        sendEvent(name: "mqttStatus", value: "Connected")
+        String node = settings.haspNode ?: "plate"
+        interfaces.mqtt.subscribe("hasp/${node}/state/statusupdate")
+        interfaces.mqtt.subscribe("hasp/${node}/state/idle")
+        interfaces.mqtt.subscribe("hasp/${node}/idle")
+        interfaces.mqtt.subscribe("hasp/${node}/state/backlight")
+        interfaces.mqtt.subscribe("hasp/${node}/backlight")
+        interfaces.mqtt.subscribe("hasp/+/LWT")
+        interfaces.mqtt.subscribe("hasp/+/state/statusupdate")
+        interfaces.mqtt.subscribe("hasp/+/state/+")
+        infoLog "[AutoPages] Subscribed -- node: ${node}"
+        // Resume any push that was deferred due to disconnect
+        if (state.deferredPages) {
+            infoLog "[AutoPages] Resuming deferred push (${state.deferredPages} pages)"
+            runIn(3, "resumeDeferredPush")
+        }
+    } catch (Exception e) {
+        infoLog "[AutoPages] ERROR -- MQTT connect failed: ${e.message}"
+        sendEvent(name: "mqttStatus", value: "Error: ${e.message}")
+        runIn(30, "connectMqtt")
+    }
+}
+
+def disconnectMqtt() {
+    try { interfaces.mqtt.disconnect() } catch (Exception e) { }
+    sendEvent(name: "mqttStatus", value: "Disconnected")
+}
+
+def resumeDeferredPush() {
+    int np = (state.deferredPages ?: 0) as int
+    if (np < 1) return
+    infoLog "[AutoPages] Resuming deferred pushAllLayouts (${np} pages)"
+    pushAllLayouts(np)
+}
+
+def reconnectMqtt() { disconnectMqtt(); pauseExecution(2000); connectMqtt() }
+
+def rebootDisplay() {
+    String node = settings.haspNode ?: "plate"
+    infoLog "[AutoPages] Sending reboot command to display"
+    safePub("hasp/${node}/command", "reboot")
+}
+
+def mqttClientStatus(String status) {
+    infoLog "[AutoPages] MQTT status: ${status}"
+    sendEvent(name: "mqttStatus", value: status)
+    if (status.startsWith("Error") || status.contains("lost")) {
+        infoLog "[AutoPages] MQTT lost -- reconnecting in 5s"
+        runIn(5, "connectMqtt")
+    }
+}
+
+def sendHeartbeat() {
+    state.lastHeartbeatMs = now()
+    boolean connected = false
+    try { connected = interfaces.mqtt.isConnected() } catch (Exception e) { connected = false }
+    if (!connected) {
+        infoLog "[AutoPages] Heartbeat: MQTT not connected -- reconnecting"
+        connectMqtt()
+        return
+    }
+    String node = settings.haspNode ?: "plate"
+    try {
+        interfaces.mqtt.publish("hasp/${node}/command", "statusupdate", 1, false)
+    } catch (Exception e) {
+        infoLog "[AutoPages] Heartbeat publish failed -- reconnecting"
+        connectMqtt()
+    }
+}
+
+// ── MQTT parse ─────────────────────────────────────────────────────────────────
+
+def parse(String description) {
+    def msg = interfaces.mqtt.parseMessage(description)
+    debugLog "MQTT: topic=${msg.topic} payload=${msg.payload}"
+
+    if (msg.topic.endsWith("/LWT")) {
+        String actualNode = msg.topic.split("/")[1]
+        String configNode = settings.haspNode ?: "plate"
+        if (actualNode != configNode) {
+            log.warn "[AutoPages] Node name mismatch! Device is '${actualNode}' but preference is '${configNode}'"
+            sendEvent(name: "mqttStatus", value: "Wrong node name -- should be '${actualNode}'")
+        }
+        if (msg.payload?.trim() == "online") {
+            infoLog "[AutoPages] LWT online (${actualNode}) -- display rebooted, pushing all layouts"
+            state.pushInProgress     = false
+            state.suppressNavigation = false
+            sendEvent(name: "pushInProgress", value: "false")
+            unschedule("rotatePage")
+            unschedule("returnToPage1AndStartRotation")
+            runIn(5, "fireDisplayRebooted")
+        }
         return
     }
 
-    int total = numberOfPages()
-    List<Integer> order = getPageOrder()
-    state.pageOrder = order
-    infoLog "[AutoPages] Display order: ${order.collect { pageType(it) }.join(' -> ')}"
-
-
-    // Push grid layouts in display order
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        String pType = pageType(srcPage)
-        String grid
-        if (pType == "mixed") {
-            int gridN = (settings["page${srcPage}MixedGrid"] ?: "1") as int
-            grid = "${gridN}x${gridN}"
-        } else if (pType == "thermostat") {
-            grid = "thermostat"
-        } else {
-            List devs = pageDevices(srcPage)
-            grid = nxnString(devs.size())
-        }
+    if (msg.topic.contains("statusupdate")) {
+        if (!msg.payload?.trim()) return
         try {
-            settings.indicatorDevice."setPage${dispPage}GridLayout"(grid)
-        } catch (Exception e) {
-            infoLog "[AutoPages] WARN -- setPage${dispPage}GridLayout failed: ${e.message}"
-        }
-    }
-
-    int activePages = activePageOrder().size()
-    try {
-        settings.indicatorDevice.setNumberOfPages(activePages)
-    } catch (Exception e) {
-        infoLog "[AutoPages] WARN -- setNumberOfPages failed: ${e.message}"
-    }
-
-    // Build slot maps and subscribe devices
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        String sType = pageType(srcPage)
-        List devs = (sType == "mixed") ? [] : sortDevicesByName(pageDevices(srcPage))
-        Map slotMap = buildSlotMap(srcPage, devs, sType)
-        state["slotMap${dispPage}"] = slotMap
-        state["pageType${dispPage}"] = sType
-        subscribePageDevices(dispPage, srcPage, sType)
-    }
-
-    subscribe(settings.indicatorDevice, "displayRebooted", displayRebootedHandler)
-    subscribe(settings.indicatorDevice, "layoutPushComplete", layoutPushCompleteHandler)
-    unsubscribe(thermostatTappedHandler)
-    unsubscribe(lightTappedHandler)
-    unschedule("pollThermostatTap")
-    subscribe(settings.indicatorDevice, "lightTapped",      lightTappedHandler)
-    subscribe(settings.indicatorDevice, "thermostatTapped", thermostatTappedHandler)
-    // Subscribe to location event for thermostat taps -- reliable cross-driver communication
-    // Subscribe to hub variable for thermostat taps
-    subscribe(location, "variable:autoPagesThermostatTap", thermostatLocationTapHandler)
-
-    String mqttSt = settings.indicatorDevice.currentValue("mqttStatus") ?: ""
-    if (mqttSt.startsWith("Connected")) {
-        infoLog "[AutoPages] Rebooting display to clear stale state"
-        try { settings.indicatorDevice.rebootDisplay() } catch (Exception e) { infoLog "[AutoPages] WARN -- rebootDisplay: ${e.message}" }
-        runIn(35, "pushSlotTypesAndLayouts")
-    } else {
-        runIn(2, "pushSlotTypesAndLayouts")
-    }
-
-    unschedule("syncLightStates")
-    int syncMins = (settings.lightSyncInterval ?: "10") as int
-    if (syncMins > 0) schedule("0 */${syncMins} * ? * *", syncLightStates)
-
-    infoLog "[AutoPages] Initialized -- ${total} page(s)"
-}
-
-private void subscribePageDevices(int dispPage, int srcPage, String pType) {
-    List<Map> entries = pageSlotEntries(srcPage)
-    entries.each { e ->
-        def dev = e.dev
-        String sType = e.sType
-        if (!dev) return
-        switch (sType) {
-            case "smoke":   subscribe(dev, "smoke",   smokeHandler);   break
-            case "motion":  subscribe(dev, "motion",  motionHandler);  break
-            case "water":   subscribe(dev, "water",   waterHandler);   break
-            case "contact": subscribe(dev, "contact", contactHandler); break
-            case "light":   subscribe(dev, "switch",  lightHandler);       break
-            case "thermostat":
-                subscribe(dev, "temperature",          thermostatHandler)
-                subscribe(dev, "heatingSetpoint",      thermostatHandler)
-                subscribe(dev, "coolingSetpoint",      thermostatHandler)
-                subscribe(dev, "thermostatMode",       thermostatHandler)
-                subscribe(dev, "thermostatOperatingState", thermostatHandler)
-                break
-        }
-    }
-}
-
-// ── Push layout ───────────────────────────────────────────────────────────────
-
-def pushSlotTypesAndLayouts() {
-    List<Integer> order = activePageOrder()
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        String sType = pageType(srcPage)
-        List devs = (sType == "mixed") ? [] : sortDevicesByName(pageDevices(srcPage))
-        pushPageSlotTypes(dispPage, srcPage, devs, sType)
-        pauseExecution(100)
-        pushPageLabels(dispPage, srcPage, devs, sType)
-        pauseExecution(100)
-    }
-
-    pauseExecution(500)
-    int activePages = activePageOrder().size()
-    try { settings.indicatorDevice.setNumberOfPages(activePages) } catch (Exception e) { }
-    pauseExecution(500)
-
-    // Register thermostat device IDs so driver can handle taps directly (no subscription needed)
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        if (pageType(srcPage) == "thermostat") {
-            def dev = settings["page${srcPage}ThermostatDevice"]
-            if (dev) {
-                try {
-                    settings.indicatorDevice."setPage${dispPage}ThermostatDevice"(dev.id.toString())
-                    // Also set the driver preference so it can call device commands directly
-                    settings.indicatorDevice.updateSetting("thermostatPage${dispPage}", [value: dev, type: "capability.thermostat"])
-                    infoLog "[AutoPages] Registered thermostat device ${dev.displayName} for page ${dispPage}"
-                } catch (Exception e) {
-                    infoLog "[AutoPages] WARN -- thermostat registration failed: ${e.message}"
-                }
+            def json = new groovy.json.JsonSlurper().parseText(msg.payload)
+            if (json.uptime == null) return
+            int uptime = (json.uptime) as int
+            if (uptime < 30) {
+                infoLog "[AutoPages] Display rebooted (uptime ${uptime}s)"
+                state.pushInProgress     = false
+                state.suppressNavigation = false
+                unschedule("rotatePage")
+                unschedule("returnToPage1AndStartRotation")
+                runIn(5, "fireDisplayRebooted")
+            } else {
+                infoLog "[AutoPages] Display woke from idle -- resyncing"
+                if (!state.pushInProgress) { runIn(2, "resyncStates") }
+                startBacklightTimer()
             }
-        }
-    }
-
-    state.appPushInProgress = true
-    try {
-        settings.indicatorDevice.pushAllLayouts(activePages)
-    } catch (Exception e) {
-        infoLog "[AutoPages] WARN -- pushAllLayouts failed: ${e.message}"
-    }
-}
-
-private void pushPageSlotTypes(int dispPage, int srcPage, List devices, String sType) {
-    Map types = [:]
-    if (sType == "mixed") {
-        int gridN = (settings["page${srcPage}MixedGrid"] ?: "1") as int
-        int totalSlots = gridN * gridN
-        (1..totalSlots).each { slot ->
-            String slotType = settings["page${srcPage}MixedSlot${slot}Type"] ?: ""
-            types[slot] = slotType ?: "none"
-        }
-    } else if (sType == "thermostat") {
-        // Slot 1 = thermostat display, slots 2-6 = thermostat control buttons
-        (1..4).each { slot -> types[slot] = "thermostat" }
-    } else {
-        int n = gridSizeFor(devices.size())
-        (1..n * n).each { slot ->
-            types[slot] = (slot <= devices.size()) ? sType : "none"
-        }
-    }
-    try {
-        switch (dispPage) {
-            case 1: settings.indicatorDevice.updatePage1SlotTypes(types); break
-            case 2: settings.indicatorDevice.updatePage2SlotTypes(types); break
-            case 3: settings.indicatorDevice.updatePage3SlotTypes(types); break
-            case 4: settings.indicatorDevice.updatePage4SlotTypes(types); break
-            case 5: settings.indicatorDevice.updatePage5SlotTypes(types); break
-            case 6: settings.indicatorDevice.updatePage6SlotTypes(types); break
-        }
-    } catch (Exception e) {
-        infoLog "[AutoPages] WARN -- updatePage${dispPage}SlotTypes failed: ${e.message}"
-    }
-}
-
-private void pushPageLabels(int dispPage, int srcPage, List devices, String sType) {
-    if (sType == "thermostat") return   // thermostat manages its own display
-    Map labels = [:]
-    if (sType == "mixed") {
-        int gridN = (settings["page${srcPage}MixedGrid"] ?: "1") as int
-        int maxChars = maxCharsForGrid(gridN)
-        (1..gridN * gridN).each { slot ->
-            String slotType = settings["page${srcPage}MixedSlot${slot}Type"] ?: ""
-            if (slotType) {
-                def dev = settings["page${srcPage}MixedSlot${slot}Device_${slotType}"]
-                if (dev) {
-                    String custom = (settings["page${srcPage}MixedSlot${slot}Label"] ?: "").trim()
-                    String name = custom ?: stripEmoji(dev.displayName ?: "")
-                    if (name) labels[slot] = wrapLabel(name, maxChars)
-                }
-            }
-        }
-    } else {
-        if (!devices) return
-        int n = gridSizeFor(devices.size())
-        int maxChars = maxCharsForGrid(n)
-        devices.eachWithIndex { dev, idx ->
-            if (!dev) return
-            int slot = idx + 1
-            String custom = (settings["page${srcPage}SlotLabel${slot}"] ?: "").trim()
-            String name = custom ?: stripEmoji(dev.displayName ?: "")
-            if (name) labels[slot] = wrapLabel(name, maxChars)
-        }
-    }
-    if (!labels) return
-    try {
-        switch (dispPage) {
-            case 1: settings.indicatorDevice.updatePage1Labels(labels); break
-            case 2: settings.indicatorDevice.updatePage2Labels(labels); break
-            case 3: settings.indicatorDevice.updatePage3Labels(labels); break
-            case 4: settings.indicatorDevice.updatePage4Labels(labels); break
-            case 5: settings.indicatorDevice.updatePage5Labels(labels); break
-            case 6: settings.indicatorDevice.updatePage6Labels(labels); break
-        }
-    } catch (Exception e) {
-        infoLog "[AutoPages] WARN -- updatePage${dispPage}Labels failed: ${e.message}"
-    }
-}
-
-// ── Event handlers ────────────────────────────────────────────────────────────
-
-def lightHandler(evt) {
-    handleEvent(evt, "light", "on")
-}
-
-def smokeHandler(evt) {
-    handleEvent(evt, "smoke", "detected")
-}
-
-def motionHandler(evt) {
-    handleEvent(evt, "motion", "active")
-}
-
-def waterHandler(evt) {
-    handleEvent(evt, "water", "wet")
-}
-
-def contactHandler(evt) {
-    handleEvent(evt, "contact", "open")
-}
-
-def thermostatLocationTapHandler(evt) {
-    // Hub variable change -- evt.value = "page,slot,mode,heat,cool"
-    handleThermostatTapInApp(evt.value)
-}
-
-private void handleThermostatTapInApp(String tapValue) {
-    List parts = tapValue?.split(",")
-    if (!parts || parts.size() < 5) { infoLog "[AutoPages] thermostatTap bad value: ${tapValue}"; return }
-    int dispPage    = parts[0] as int
-    int slot        = parts[1] as int
-    String mode     = parts[2]   // use mode from driver state, not device current value
-    BigDecimal heat = parts[3] as BigDecimal
-    BigDecimal cool = parts[4] as BigDecimal
-    List<String> modes = ["off", "heat", "cool"]
-
-    List<Integer> order = getPageOrder()
-    if (dispPage < 1 || dispPage > order.size()) return
-    int srcPage = order[dispPage - 1]
-    if (pageType(srcPage) != "thermostat") return
-    def dev = settings["page${srcPage}ThermostatDevice"]
-    if (!dev) { infoLog "[AutoPages] thermostatTap: no device for page ${srcPage}"; return }
-
-    infoLog "[AutoPages] Thermostat tap page ${dispPage} slot ${slot}: mode=${mode} heat=${heat} cool=${cool}"
-    switch (slot) {
-        case 2:
-            if      (mode == "heat") dev.setHeatingSetpoint(heat + 1)
-            else if (mode == "cool") dev.setCoolingSetpoint(cool + 1)
-            break
-        case 3:
-            // Cycle: cool -> off -> heat -> cool
-            List<String> cycle = ["cool", "off", "heat"]
-            String liveMode = dev.currentValue("thermostatMode") ?: "off"
-            int curIdx = cycle.indexOf(liveMode)
-            if (curIdx < 0) curIdx = 0
-            String next = cycle[(curIdx + 1) % cycle.size()]
-            infoLog "[AutoPages] Mode: ${liveMode} -> ${next}"
-            dev.setThermostatMode(next)
-            break
-        case 4:
-            if      (mode == "heat") dev.setHeatingSetpoint(heat - 1)
-            else if (mode == "cool") dev.setCoolingSetpoint(cool - 1)
-            break
-    }
-    // Sync display after 3s -- thermostatHandler subscription unreliable
-    state.pendingThermostatSyncPage = dispPage
-    runIn(3, "runPendingThermostatSync")
-}
-
-def runPendingThermostatSync() {
-    int dispPage = (state.pendingThermostatSyncPage ?: 0) as int
-    if (dispPage < 1) return
-    List<Integer> order = getPageOrder()
-    if (dispPage > order.size()) return
-    int srcPage = order[dispPage - 1]
-    def dev = settings["page${srcPage}ThermostatDevice"]
-    if (dev) syncThermostatDisplay(dispPage, dev)
-}
-
-
-
-def thermostatHandler(evt) {
-    debugLog "[AutoPages] thermostatHandler: ${evt.device.displayName} ${evt.name}=${evt.value}"
-    if (state.appPushInProgress) return
-    String deviceId = evt.device.id.toString()
-    List<Integer> order = activePageOrder()
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        if (pageType(srcPage) != "thermostat") return
-        def dev = settings["page${srcPage}ThermostatDevice"]
-        if (!dev || dev.id.toString() != deviceId) return
-        syncThermostatDisplay(dispPage, dev)
-    }
-}
-
-def thermostatTappedHandler(evt) {
-    // Handled by thermostatLocationTapHandler via hub variable -- this is a no-op
-}
-
-private void syncThermostatDisplay(int dispPage, dev) {
-    String temp  = (dev.currentValue("temperature") ?: "--").toString()
-    String heat  = (dev.currentValue("heatingSetpoint") ?: "--").toString()
-    String cool  = (dev.currentValue("coolingSetpoint") ?: "--").toString()
-    String mode  = (dev.currentValue("thermostatMode") ?: "off").toString()
-    String opSt  = (dev.currentValue("thermostatOperatingState") ?: "idle").toString()
-    infoLog "[AutoPages] Thermostat sync p${dispPage}: temp=${temp} heat=${heat} cool=${cool} mode=${mode} op=${opSt}"
-    Map data = [temp: temp, heatSetpoint: heat, coolSetpoint: cool, mode: mode, operatingState: opSt]
-    try {
-        settings.indicatorDevice.updateThermostatDisplay(dispPage, data)
-    } catch (Exception e) {
-        infoLog "[AutoPages] WARN -- updateThermostatDisplay failed: ${e.message}"
-    }
-}
-
-private void handleEvent(evt, String sType, String activeValue) {
-    if (state.appPushInProgress) {
-        debugLog "[AutoPages] Skipping event during push: ${evt.displayName} ${evt.value}"
+        } catch (Exception e) { infoLog "[AutoPages] WARN -- Could not parse statusupdate: ${e.message}" }
         return
     }
 
-    String deviceId = evt.device.id.toString()
-    List<Integer> order = activePageOrder()
-    boolean found = false
-
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        String pType = pageType(srcPage)
-
-        if (pType == "mixed") {
-            // Search mixed slots for this device + matching type
-            int gridN = (settings["page${srcPage}MixedGrid"] ?: "1") as int
-            (1..gridN * gridN).each { slot ->
-                String slotType = settings["page${srcPage}MixedSlot${slot}Type"] ?: ""
-                if (slotType != sType) return
-                def dev = settings["page${srcPage}MixedSlot${slot}Device_${slotType}"]
-                if (!dev || dev.id.toString() != deviceId) return
-                found = true
-                debugLog "Event p${dispPage}s${slot} ${sType} mixed (${evt.displayName}): ${evt.value}"
-                if (evt.value == activeValue) {
-                    settings.indicatorDevice."setPage${dispPage}MotionActive"(slot)
-                } else {
-                    settings.indicatorDevice."setPage${dispPage}MotionInactive"(slot)
-                }
-            }
-        } else {
-            if (pType != sType) return
-            Map slotMap = state["slotMap${dispPage}"] ?: [:]
-            int slot = (slotMap[deviceId] ?: 0) as int
-            if (slot < 1) return
-            found = true
-            debugLog "Event p${dispPage}s${slot} ${sType} (${evt.displayName}): ${evt.value}"
-            if (evt.value == activeValue) {
-                settings.indicatorDevice."setPage${dispPage}MotionActive"(slot)
-            } else {
-                settings.indicatorDevice."setPage${dispPage}MotionInactive"(slot)
-            }
+    if (msg.topic.contains("state/idle") || msg.topic.endsWith("/idle")) {
+        String v = msg.payload?.trim()
+        if (v == "short" || v == "long") {
+            state.screenIdle = true
+        } else if (v == "off") {
+            long ms = now() - (state.lastHeartbeatMs ?: 0L)
+            if (ms >= 3000) { state.screenIdle = false; infoLog "[AutoPages] Screen woke from touch"; startBacklightTimer() }
         }
+        return
     }
 
-    if (!found) infoLog "[AutoPages] WARN -- device ${deviceId} not found in any ${sType} slot map"
+    if (msg.topic.contains("state/backlight") || msg.topic.endsWith("/backlight")) {
+        try {
+            def json = new groovy.json.JsonSlurper().parseText(msg.payload)
+            if (json.state == "off") { state.screenIdle = true }
+            else if (json.state == "on" && state.screenIdle) { state.screenIdle = false; startBacklightTimer() }
+        } catch (Exception e) { if (msg.payload?.trim() == "off") state.screenIdle = true }
+        return
+    }
+
+    String cfgNode = settings.haspNode ?: "plate"
+    if (msg.topic.contains("/state/p") && msg.topic.contains("b") && msg.topic.contains(cfgNode)) {
+        debugLog "[AutoPages] Button topic: ${msg.topic} payload: ${msg.payload}"
+        handleButtonTap(msg.topic, msg.payload)
+        return
+    }
 }
 
-// ── Light tap handler ─────────────────────────────────────────────────────────
+// ── Button tap handler ─────────────────────────────────────────────────────────
 
-def lightTappedHandler(evt) {
-    infoLog "[AutoPages] lightTappedHandler fired: ${evt.value}"
-    List parts = evt.value?.split(",")
-    if (!parts || parts.size() < 2) { infoLog "[AutoPages] WARN bad lightTapped value"; return }
-    int dispPage = parts[0] as int
-    int slot = parts[1] as int
-    List<Integer> order = getPageOrder()
-    if (dispPage < 1 || dispPage > order.size()) { infoLog "[AutoPages] WARN dispPage out of range"; return }
+private void handleButtonTap(String topic, String payload) {
+    if (!payload?.contains('"up"')) return
+    def matcher = topic =~ /state\/p(\d+)b(\d+)$/
+    if (!matcher) return
+    int page  = matcher[0][1] as int
+    int btnId = matcher[0][2] as int
+    if (btnId < 1 || btnId > 49) return
+    int slot = btnId
+    String sType = state[typeKey(page, slot)] ?: "none"
+    if (sType == "light") {
+        debugLog "[AutoPages] Light tile tapped: page ${page} slot ${slot}"
+        sendEvent(name: "lightTapped", value: "${page},${slot},${now()}")
+        return
+    }
+    if (sType == "thermostat") {
+        debugLog "[AutoPages] Thermostat tile tapped: page ${page} slot ${slot}"
+        sendEvent(name: "thermostatTapped", value: "${page},${slot},${now()}")
+        handleThermostatTap(page, slot)
+        return
+    }
+}
 
-    int srcPage = order[dispPage - 1]
-    String pType = pageType(srcPage)
+// ── Thermostat device registration ────────────────────────────────────────────
 
-    def dev = null
+def setPage1ThermostatDevice(String deviceId) { state.p1ThermostatDeviceId = deviceId }
+def setPage2ThermostatDevice(String deviceId) { state.p2ThermostatDeviceId = deviceId }
+def setPage3ThermostatDevice(String deviceId) { state.p3ThermostatDeviceId = deviceId }
+def setPage4ThermostatDevice(String deviceId) { state.p4ThermostatDeviceId = deviceId }
+def setPage5ThermostatDevice(String deviceId) { state.p5ThermostatDeviceId = deviceId }
+def setPage6ThermostatDevice(String deviceId) { state.p6ThermostatDeviceId = deviceId }
 
-    if (pType == "mixed") {
-        // Find which device is in this slot
-        String slotType = settings["page${srcPage}MixedSlot${slot}Type"] ?: ""
-        if (slotType != "light") { infoLog "[AutoPages] WARN mixed slot ${slot} is not a light (${slotType})"; return }
-        dev = settings["page${srcPage}MixedSlot${slot}Device_${slotType}"]
+// ── Thermostat display ────────────────────────────────────────────────────────
+
+// Called by the app whenever any thermostat attribute changes.
+// data map keys: temp, heatSetpoint, coolSetpoint, mode, operatingState
+def updateThermostatDisplay(page, data) {
+    int pg = page as int
+    if (!data) return
+    String node    = settings.haspNode ?: "plate"
+
+    // Parse values
+    String temp    = data.temp          ?: "--"
+    String heat    = data.heatSetpoint  ?: "--"
+    String cool    = data.coolSetpoint  ?: "--"
+    String mode    = data.mode          ?: "off"
+    String opState = data.operatingState ?: "idle"
+
+    // Store all values in state so resyncStates can re-push without app
+    state["p${pg}thermostatTemp"]    = temp
+    state["p${pg}thermostatMode"]    = mode
+    state["p${pg}thermostatHeat"]    = heat
+    state["p${pg}thermostatCool"]    = cool
+    state["p${pg}thermostatOpState"] = opState
+
+    pushThermostatTile(pg, node, temp, heat, cool, mode, opState)
+}
+
+private void handleThermostatTap(int page, int slot) {
+    if (slot < 2 || slot > 4) return
+    String mode = (state["p${page}thermostatMode"] ?: "off") as String
+    String heat = (state["p${page}thermostatHeat"] ?: "68") as String
+    String cool = (state["p${page}thermostatCool"] ?: "76") as String
+    String val  = "${page},${slot},${mode},${heat},${cool}"
+    infoLog "[AutoPages] Thermostat tap page ${page} slot ${slot}: mode=${mode}"
+    // Write hub variable -- app subscribes to hubVariable changes (reliable cross-driver IPC)
+    try {
+        setGlobalVar("autoPagesThermostatTap", val)
+    } catch (Exception e) {
+        infoLog "[AutoPages] Hub variable write failed -- create string hub variable named 'autoPagesThermostatTap': ${e.message}"
+    }
+    sendEvent(name: "thermostatTapped", value: "${page},${slot},${now()}")
+}
+
+private void pushThermostatTile(int pg, String node, String temp, String heat, String cool, String mode, String opState) {
+    // Tile 1: current temp + active setpoint
+    String setpoint = (mode == "heat") ? heat : (mode == "cool") ? cool : "--"
+    String spLabel  = (mode == "heat") ? "H:" : (mode == "cool") ? "C:" : ""
+    String mainText = temp + "\u00B0\n" + (mode == "off" ? "Off" : spLabel + setpoint)
+    String bgColor  = thermostatColorForState(opState, mode)
+    String fgColor  = contrastColor(bgColor)
+    debugLog "[AutoPages] Thermostat: page=${pg} temp=${temp} mode=${mode} sp=${setpoint} state=${opState}"
+    String mainJsonl = '{"page":' + pg + ',"id":1,"bg_color":"' + bgColor + '","text_color":"' + fgColor + '","text":"' + mainText + '"}' 
+    safePub("hasp/" + node + "/command/jsonl", mainJsonl)
+    pauseExecution(20)
+
+    // Tiles 2(+) and 4(-): active in heat/cool mode, grayed out when off
+    // plus=\uE415, minus=\uE374 from openHASP 0.7 font table
+    boolean active = (mode == "heat" || mode == "cool")
+    String btnBg = active ? "#1A2A3A" : "#222222"
+    String btnFg = active ? "#FFFFFF" : "#555555"
+
+    String plusGlyph  = iconToJsonEscape("\uE415")
+    String minusGlyph = iconToJsonEscape("\uE374")
+
+    // Tile 2: + icon
+    String plusJsonl = '{"page":' + pg + ',"id":2,"bg_color":"' + btnBg + '","text_color":"' + btnFg + '","text":"' + plusGlyph + '","click":' + active + '}'
+    safePub("hasp/" + node + "/command/jsonl", plusJsonl)
+    pauseExecution(15)
+
+    // Tile 3: mode cycle button
+    String modeJsonl = '{"page":' + pg + ',"id":3,"bg_color":"#1A2A3A","text_color":"#FFFFFF","text":"' + mode.capitalize() + '","click":true}'
+    safePub("hasp/" + node + "/command/jsonl", modeJsonl)
+    pauseExecution(15)
+
+    // Tile 4: - icon
+    String minusJsonl = '{"page":' + pg + ',"id":4,"bg_color":"' + btnBg + '","text_color":"' + btnFg + '","text":"' + minusGlyph + '","click":' + active + '}'
+    safePub("hasp/" + node + "/command/jsonl", minusJsonl)
+}
+
+private String thermostatColorFor(String opState) {
+    return thermostatColorForState(opState, null)
+}
+
+private String thermostatColorForState(String opState, String mode) {
+    switch (opState) {
+        case "heating":       return (settings.colorThermostatHeating ?: "#FF6600")
+        case "cooling":       return (settings.colorThermostatCooling ?: "#0088FF")
+        case "fan only":      return (settings.colorThermostatFan     ?: "#008080")
+        case "off":           return (settings.colorThermostatOff     ?: "#303030")
+        default:
+            // Idle -- tint based on mode so user knows what mode is set
+            if      (mode == "heat") return "#804020"   // dark orange = heat mode idle
+            else if (mode == "cool") return "#004488"   // dark blue = cool mode idle
+            else if (mode == "off")  return (settings.colorThermostatOff ?: "#303030")
+            return (settings.colorThermostatIdle ?: "#606060")
+    }
+}
+
+// ── Backlight ──────────────────────────────────────────────────────────────────
+
+private void startBacklightTimer() {
+    if (!settings.backlightOnMotion) return
+    unschedule("backlightOff")
+    if (!allInactive()) {
+        int mins = (settings.motionBacklightTimeout != null ? settings.motionBacklightTimeout : 1) as int
+        if (mins > 0) runIn(mins * 60, "motionTimeoutBacklightOff")
     } else {
-        if (pType != "light") { infoLog "[AutoPages] WARN not a light page"; return }
-        List devs = pageDevices(srcPage)
-        if (slot < 1 || slot > (devs?.size() ?: 0)) { infoLog "[AutoPages] WARN slot out of range"; return }
-        dev = devs[slot - 1]
+        int delay = (settings.touchBacklightTimeout != null ? settings.touchBacklightTimeout : 30) as int
+        if (delay > 0) runIn(delay, "backlightOff")
     }
-
-    if (!dev) { infoLog "[AutoPages] WARN dev is null"; return }
-    String curState = dev.currentValue("switch") ?: "off"
-    infoLog "[AutoPages] Toggling light: ${dev.displayName} (p${dispPage}s${slot}) currently ${curState}"
-    if (curState == "on") { dev.off() } else { dev.on() }
 }
 
-// ── Display reboot / push complete ───────────────────────────────────────────
+def backlightOff() { publishBacklight(false); state.screenIdle = true }
 
-def layoutPushCompleteHandler(evt) {
-    state.appPushInProgress = false
-    infoLog "[AutoPages] layoutPushCompleteHandler fired -- calling syncAllSensors"
-    syncAllSensors()
+def backlightOnAfterFade() {
+    if (!settings.backlightOnMotion || !allInactive()) return
+    state.screenIdle = false; publishBacklight(true)
+    int delay = (settings.backlightOffDelay != null ? settings.backlightOffDelay : 0) as int
+    if (delay > 0) runIn(delay, "backlightOff")
 }
 
-def displayRebootedHandler(evt) {
-    state.appPushInProgress = false
-    infoLog "[AutoPages] Display rebooted -- repushing everything"
-    // Re-subscribe in case subscriptions were lost
-    subscribe(settings.indicatorDevice, "layoutPushComplete", layoutPushCompleteHandler)
-    subscribe(settings.indicatorDevice, "thermostatTapped",   thermostatTappedHandler)
-    infoLog "[AutoPages] Subscriptions re-established"
-    subscribe(settings.indicatorDevice, "lightTapped",        lightTappedHandler)
-    List<Integer> ord = activePageOrder()
-    state.pageOrder = ord
-    ord.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        String pType = pageType(srcPage)
-        String grid
-        if (pType == "mixed") {
-            int gridN = (settings["page${srcPage}MixedGrid"] ?: "1") as int
-            grid = "${gridN}x${gridN}"
-        } else if (pType == "thermostat") {
-            grid = "thermostat"
-        } else {
-            List devs = pageDevices(srcPage)
-            grid = nxnString(devs.size())
-        }
-        try { settings.indicatorDevice."setPage${dispPage}GridLayout"(grid) } catch (Exception e) { }
-    }
-    try { settings.indicatorDevice.setNumberOfPages(getPageOrder().size()) } catch (Exception e) { }
-    runIn(2, "pushSlotTypesAndLayouts")
+def motionTimeoutBacklightOff() {
+    if (!settings.backlightOnMotion) return
+    if (!allInactive()) { backlightOff() }
 }
 
-// ── State sync ────────────────────────────────────────────────────────────────
-
-def syncLightStates() {
-    List<Integer> order = activePageOrder()
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        String pType = pageType(srcPage)
-        if (pType == "mixed") {
-            int gridN = (settings["page${srcPage}MixedGrid"] ?: "1") as int
-            (1..gridN * gridN).each { slot ->
-                String slotType = settings["page${srcPage}MixedSlot${slot}Type"] ?: ""
-                if (slotType != "light") return
-                def dev = settings["page${srcPage}MixedSlot${slot}Device_${slotType}"]
-                if (!dev) return
-                String cur = dev.currentValue("switch") ?: "off"
-                if (cur == "on") {
-                    settings.indicatorDevice."setPage${dispPage}MotionActive"(slot)
-                } else {
-                    settings.indicatorDevice."setPage${dispPage}MotionInactive"(slot)
-                }
-                pauseExecution(30)
-            }
-        } else if (pType == "light") {
-            List devs = sortDevicesByName(pageDevices(srcPage))
-            devs.eachWithIndex { dev, idx ->
-                if (!dev) return
-                int slot = idx + 1
-                String cur = dev.currentValue("switch") ?: "off"
-                if (cur == "on") {
-                    settings.indicatorDevice."setPage${dispPage}MotionActive"(slot)
-                } else {
-                    settings.indicatorDevice."setPage${dispPage}MotionInactive"(slot)
-                }
-                pauseExecution(30)
-            }
+private boolean allInactive() {
+    int numPg = (state.numberOfPages ?: 6) as int
+    (1..numPg).every { pg ->
+        (1..maxSensors(pg)).every { idx ->
+            String sType = state[typeKey(pg, idx)] ?: "none"
+            if (sType == "light") return true
+            return state[stateKey(pg, idx)] != "active"
         }
     }
 }
 
-def syncAllSensors() {
-    infoLog "[AutoPages] Syncing all sensor states (appPushInProgress=${state.appPushInProgress})"
-    state.appPushInProgress = false
-    List<Integer> order = activePageOrder()
-    order.eachWithIndex { srcPage, dispIdx ->
-        int dispPage = dispIdx + 1
-        List<Map> entries = pageSlotEntries(srcPage)
-        String pType = pageType(srcPage)
+private void publishBacklight(boolean on) {
+    String node = settings.haspNode ?: "plate"
+    safePub("hasp/${node}/command/backlight", on ? '{"state":"on","brightness":255}' : '{"state":"off"}')
+}
 
-        // For single-type pages, also clear empty trailing slots
-        int totalSlots = 0
-        if (pType != "mixed") {
-            List devs = sortDevicesByName(pageDevices(srcPage))
-            int n = gridSizeFor(devs.size())
-            totalSlots = n * n
-        }
+// ── Resync ─────────────────────────────────────────────────────────────────────
 
-        entries.each { e ->
-            def dev = e.dev
-            String sType = e.sType
-            int slot = e.slot
-            if (!dev) return
-            if (sType == "thermostat") {
-                syncThermostatDisplay(dispPage, dev)
-                return
-            }
-            String attr = attributeFor(sType)
-            String actVal = activeValueFor(sType)
-            String cur = dev.currentValue(attr) ?: ""
-            debugLog "Sync p${dispPage}s${slot} ${sType} (${dev.displayName}) = ${cur}"
-            if (cur == actVal) {
-                settings.indicatorDevice."setPage${dispPage}MotionActive"(slot)
+def resyncStates() {
+    if (state.pushInProgress) { infoLog "[AutoPages] Skipping resync -- layout push in progress"; return }
+    infoLog "[AutoPages] Resyncing all page states"
+    int numPg = (state.numberOfPages ?: 6) as int
+    (1..numPg).each { pg ->
+        String pgGrid = activeGrid(pg)
+        if (pgGrid == "thermostat") {
+            // Re-push thermostat tile from stored state -- no app subscription needed
+            String nd   = settings.haspNode ?: "plate"
+            String temp = (state["p${pg}thermostatTemp"]    ?: "--") as String
+            String heat = (state["p${pg}thermostatHeat"]    ?: "--") as String
+            String cool = (state["p${pg}thermostatCool"]    ?: "--") as String
+            String mode = (state["p${pg}thermostatMode"]    ?: "off") as String
+            String ops  = (state["p${pg}thermostatOpState"] ?: "idle") as String
+            if (temp == "--") {
+                // No stored data yet -- fire layoutPushComplete to ask app to sync
+                sendEvent(name: "layoutPushComplete", value: new Date().format("yyyy-MM-dd HH:mm:ss"))
             } else {
-                settings.indicatorDevice."setPage${dispPage}MotionInactive"(slot)
+                pushThermostatTile(pg, nd, temp, heat, cool, mode, ops)
             }
-            pauseExecution(40)
+            return
         }
-
-        if (pType != "mixed" && entries.size() < totalSlots) {
-            ((entries.size() + 1)..totalSlots).each { slot ->
-                settings.indicatorDevice."setPage${dispPage}SlotEmpty"(slot)
-                pauseExecution(30)
+        (1..maxSensors(pg)).each { idx ->
+            String st = state[stateKey(pg, idx)] ?: "inactive"
+            if      (st == "empty")  { setSlotEmptyForPage(pg, idx) }
+            else if (st == "active") { setMotionActiveForPage(pg, idx) }
+            else {
+                String rc = inactiveColorFor(pg, idx)
+                publishColor(pg, idx, rc)
+                publishIcon(pg, idx, inactiveIconFor(pg, idx), rc)
             }
+            pauseExecution(30)
         }
     }
 }
 
-// ── Grid / label helpers ──────────────────────────────────────────────────────
-
-private int gridSizeFor(int count) {
-    if (count <= 1) return 1
-    if (count <= 4) return 2
-    if (count <= 9) return 3
-    if (count <= 16) return 4
-    if (count <= 25) return 5
-    if (count <= 36) return 6
-    return 7
+def fireDisplayRebooted() {
+    sendEvent(name: "displayRebooted", value: new Date().format("yyyy-MM-dd HH:mm:ss"))
 }
 
-private String nxnString(int count) {
-    int n = gridSizeFor(count)
-    return "${n}x${n}"
+// ── Layout push ────────────────────────────────────────────────────────────────
+
+def pushAllLayouts(numberOfPages) {
+    int np = Math.min(6, Math.max(1, (numberOfPages as int)))
+    // Don't push into a dead connection -- wait for reconnect then LWT will retrigger.
+    // Use interfaces.mqtt.isConnected() not the device attribute -- the attribute
+    // persists across Hubitat restarts and causes false "Connected" on startup.
+    boolean mqttUp = false
+    try { mqttUp = interfaces.mqtt.isConnected() } catch (Exception e) { mqttUp = false }
+    if (!mqttUp) {
+        infoLog "[AutoPages] pushAllLayouts deferred -- MQTT not connected"
+        state.deferredPages = np
+        return
+    }
+    state.numberOfPages      = np
+    state.deferredPages      = null
+    state.lastPushMs         = now()
+    state.pushInProgress     = true
+    state.suppressNavigation = true
+    state.rotationPage       = 1
+    sendEvent(name: "pushInProgress", value: "true")
+    unschedule("rotatePage")
+    unschedule("returnToPage1AndStartRotation")
+    infoLog "[AutoPages] pushAllLayouts -- ${np} page(s)"
+    sendEvent(name: "mqttStatus", value: "Building layouts...")
+    String node = settings.haspNode ?: "plate"
+    safePub("hasp/${node}/command", "clearpage 0")
+    pauseExecution(500)
+    runIn(2, "pushPage1Layout")
+}
+
+def pushPage1Layout() { publishBacklight(true); pushPageLayout(1) }
+def pushPage2Layout() { int np2 = (state.numberOfPages ?: 6) as int; if (np2 >= 2) pushPageLayout(2) }
+def pushPage3Layout() { int np3 = (state.numberOfPages ?: 6) as int; if (np3 >= 3) pushPageLayout(3) }
+def pushPage4Layout() { int np4 = (state.numberOfPages ?: 6) as int; if (np4 >= 4) pushPageLayout(4) }
+def pushPage5Layout() { int np5 = (state.numberOfPages ?: 6) as int; if (np5 >= 5) pushPageLayout(5) }
+def pushPage6Layout() { int np6 = (state.numberOfPages ?: 6) as int; if (np6 >= 6) pushPageLayout(6) }
+
+private void pushPageLayout(int page) {
+    String grid     = activeGrid(page)
+    int total       = (state.numberOfPages ?: 6) as int
+    String node     = settings.haspNode ?: "plate"
+    int tileFont    = tileFontFor(grid)
+    int slots       = maxSensors(page)
+
+    infoLog "[AutoPages] Pushing page ${page}/${total}: grid='${grid}' slots=${slots} storedGrid='${state["page${page}GridLayout"]}' storedSlots='${state["page${page}MaxSlots"]}'"
+    sendEvent(name: "mqttStatus", value: "Pushing page ${page}/${total}...")
+
+    safePub("hasp/${node}/command", "clearpage ${page}")
+    pauseExecution(150)
+
+    (1..slots).each { s ->
+        unschedule("p${page}fadeStep${s}")
+        state.remove("p${page}fadeStep${s}")
+    }
+
+    // 1. Layout JSONL -- tile structure
+    layoutJsonl(grid, page, total).each { jsonl ->
+        safePub("hasp/${node}/command/jsonl", jsonl)
+        pauseExecution(40)
+    }
+
+    pauseExecution(150)
+
+    // 2. Slot colors and icons
+    // Thermostat pages have a fixed slot layout rendered by pushThermostatSlots.
+    if (grid == "thermostat") {
+        // Button labels are set by updateThermostatDisplay after app syncs
+        // Set placeholder text on control buttons
+        String nd = settings.haspNode ?: "plate"
+        // Placeholder labels using JSON-escaped icon glyphs
+        [[2,"\uE415"], [3,"Mode"], [4,"\uE374"]].each { entry ->
+            int sid = entry[0] as int
+            String lbl = iconToJsonEscape(entry[1] as String)
+            String lblJsonl = '{"page":' + page + ',"id":' + sid + ',"text":"' + lbl + '"}' 
+            safePub("hasp/" + nd + "/command/jsonl", lblJsonl)
+            pauseExecution(20)
+        }
+        int drainSecs2 = 3
+        switch (page) {
+            case 1: runIn(drainSecs2, "navigatePage1"); break
+            case 2: runIn(drainSecs2, "navigatePage2"); break
+            case 3: runIn(drainSecs2, "navigatePage3"); break
+            case 4: runIn(drainSecs2, "navigatePage4"); break
+            case 5: runIn(drainSecs2, "navigatePage5"); break
+            case 6: runIn(drainSecs2, "navigatePage6"); break
+        }
+        return
+    }
+
+    // Icons sent via JSONL to preserve non-ASCII (raw topic strips Unicode private-use chars).
+    // Labels come from syncAllSensors after push -- no need to duplicate here.
+    (1..slots).each { idx ->
+        try {
+            String slotType = state[typeKey(page, idx)] ?: "none"
+
+            if (!slotType || slotType == "none") {
+                publishColor(page, idx, "#708090")
+                publishIconJsonl(node, page, idx, "", "#708090")
+            } else if (slotType == "light") {
+                String lightState = state[stateKey(page, idx)] ?: "inactive"
+                String lightColor = (lightState == "active") ? (settings.colorLightActive ?: "#FFFF00") : inactiveColorFor(page, idx)
+                publishColor(page, idx, lightColor)
+                publishIconJsonl(node, page, idx, lightState == "active" ? ICON_LIGHTBULB_ON() : ICON_LIGHTBULB_OFF(), lightColor)
+                String lbl        = state[labelKey(page, idx)] ?: ""
+                String clickJsonl = buildLightTileJsonl(page, idx, grid, tileFont, lightColor, lbl)
+                if (clickJsonl) {
+                    pauseExecution(20)
+                    safePub("hasp/${node}/command/jsonl", clickJsonl)
+                }
+            } else {
+                String ic = inactiveColorFor(page, idx)
+                publishColor(page, idx, ic)
+                publishIconJsonl(node, page, idx, inactiveIconFor(page, idx), ic)
+                String lbl = state[labelKey(page, idx)] ?: ""
+                if (lbl) {
+                    String escapedLbl = lbl.replace('"', '\\"').replace('\n', '\\n')
+                    String lblJsonl = '{"page":' + page + ',"id":' + bgId(idx) + ',"text":"' + escapedLbl + '"}'
+                    safePub("hasp/" + node + "/command/jsonl", lblJsonl)
+                }
+            }
+        } catch (Exception e) {
+            infoLog "[AutoPages] WARN -- slot ${idx} render failed: ${e.message}"
+        }
+        pauseExecution(20)
+    }
+
+    int drainSecs = 3 + (int)(slots * 0.1)
+    infoLog "[AutoPages] Scheduling navigate to page ${page}/${total} in ${drainSecs}s"
+    switch (page) {
+        case 1: runIn(drainSecs, "navigatePage1"); break
+        case 2: runIn(drainSecs, "navigatePage2"); break
+        case 3: runIn(drainSecs, "navigatePage3"); break
+        case 4: runIn(drainSecs, "navigatePage4"); break
+        case 5: runIn(drainSecs, "navigatePage5"); break
+        case 6: runIn(drainSecs, "navigatePage6"); break
+    }
+}
+
+def navigatePage1() { doNavigate(1) }
+def navigatePage2() { doNavigate(2) }
+def navigatePage3() { doNavigate(3) }
+def navigatePage4() { doNavigate(4) }
+def navigatePage5() { doNavigate(5) }
+def navigatePage6() { doNavigate(6) }
+
+private void doNavigate(int page) {
+    int total   = (state.numberOfPages ?: 6) as int
+    String node = settings.haspNode ?: "plate"
+    infoLog "[AutoPages] Navigating to page ${page}/${total}"
+    // Navigate to this page so the user sees it
+    safePub("hasp/${node}/command/page", "${page}")
+    if (page < total) {
+        // Build the next page while the user is viewing this one
+        infoLog "[AutoPages] Scheduling next page build after page ${page}"
+        switch (page) {
+            case 1: runIn(3, "pushPage2Layout"); break
+            case 2: runIn(3, "pushPage3Layout"); break
+            case 3: runIn(3, "pushPage4Layout"); break
+            case 4: runIn(3, "pushPage5Layout"); break
+            case 5: runIn(3, "pushPage6Layout"); break
+        }
+    } else {
+        // Last page is now visible -- stay here a moment then return to page 1
+        state.pushInProgress = false
+        infoLog "[AutoPages] All ${total} page(s) pushed"
+        runIn(12, "returnToPage1AndStartRotation")
+    }
+}
+
+def returnToPage1AndStartRotation() {
+    String node  = settings.haspNode ?: "plate"
+    int numPg    = (state.numberOfPages ?: 1) as int
+    // Re-push any thermostat tiles from stored state -- clearpage wiped them during layout build
+    (1..numPg).each { pg ->
+        if (activeGrid(pg) == "thermostat") {
+            String temp = (state["p${pg}thermostatTemp"]    ?: "--") as String
+            String heat = (state["p${pg}thermostatHeat"]    ?: "--") as String
+            String cool = (state["p${pg}thermostatCool"]    ?: "--") as String
+            String mode = (state["p${pg}thermostatMode"]    ?: "off") as String
+            String ops  = (state["p${pg}thermostatOpState"] ?: "idle") as String
+            pushThermostatTile(pg, node, temp, heat, cool, mode, ops)
+            pauseExecution(50)
+        }
+    }
+    safePub("hasp/${node}/command/page", "1")
+    state.pushInProgress = false
+    sendEvent(name: "pushInProgress",     value: "false")
+    sendEvent(name: "mqttStatus",         value: "Connected")
+    sendEvent(name: "layoutPushComplete", value: new Date().format("yyyy-MM-dd HH:mm:ss"))
+    infoLog "[AutoPages] Layout push complete -- syncAllSensors will follow"
+    // Start rotation after sync has had time to complete (~15s)
+    // suppressNavigation cleared in startRotationAfterSync so sensor events don't race
+    int total = (state.numberOfPages ?: 1) as int
+    if (total > 1) {
+        runIn(15, "startRotationAfterSync")
+    } else {
+        state.suppressNavigation = false
+    }
+}
+
+def startRotationAfterSync() {
+    state.suppressNavigation = false
+    int total  = (state.numberOfPages ?: 1) as int
+    int rotInt = (settings.rotationInterval ?: 0) as int
+    if (total > 1 && rotInt > 0) {
+        state.rotationPage = 1
+        unschedule("rotatePage")
+        runIn(rotInt, "rotatePage")
+        infoLog "[AutoPages] Rotation started -- every ${rotInt}s"
+    }
+}
+
+// Restart page rotation if it was stopped by a sensor event and all sensors are now inactive.
+private void maybeRestartRotation() {
+    int total  = (state.numberOfPages ?: 1) as int
+    int rotInt = (settings.rotationInterval ?: 0) as int
+    if (total < 2 || rotInt < 1) return
+    // Only restart if rotatePage is not already scheduled
+    unschedule("rotatePage")
+    runIn(rotInt, "rotatePage")
+    infoLog "[AutoPages] Rotation restarted after all sensors inactive"
+}
+
+// ── Layout JSONL generators ────────────────────────────────────────────────────
+
+private List<String> layoutJsonl(String grid, int page, int totalPages) {
+    List<String> out
+    switch (grid) {
+        case "thermostat": out = layoutThermostat(page); break
+        case "1x1": out = layout1x1(page); break
+        case "3x3": out = layout3x3(page); break
+        case "4x4": out = layout4x4(page); break
+        case "5x5": out = layoutNxN(page, 5, 94, 2, 12, 2, 24); break
+        case "6x6": out = layoutNxN(page, 6, 78, 2, 12, 2, 12); break
+        case "7x7": out = layoutNxN(page, 7, 67, 1, 12, 1, 12); break
+        default:    out = layout2x2(page)
+    }
+
+    if (totalPages > 1) {
+        int prevPage = (page == 1) ? totalPages : page - 1
+        int nextPage = (page == totalPages) ? 1 : page + 1
+        out << """{"page":${page},"id":201,"obj":"btn","x":0,"y":0,"w":30,"h":480,"bg_color":"#000000","bg_opa":20,"border_width":0,"radius":0,"text":"","text_font":8,"toggle":false,"action":"p${prevPage}"}"""
+        out << """{"page":${page},"id":202,"obj":"btn","x":450,"y":0,"w":30,"h":480,"bg_color":"#000000","bg_opa":20,"border_width":0,"radius":0,"text":"","text_font":8,"toggle":false,"action":"p${nextPage}"}"""
+        if (settings.showPageIndicator == true) {
+            out << """{"page":${page},"id":200,"obj":"label","x":424,"y":4,"w":54,"h":22,"bg_color":"#000000","bg_opa":180,"border_width":0,"radius":4,"text":"${page}/${totalPages}","text_font":16,"text_color":"white","align":"center","click":false}"""
+        } else {
+            out << """{"page":${page},"id":200,"obj":"label","x":0,"y":0,"w":1,"h":1,"bg_opa":0,"border_width":0,"text":"","text_font":8,"click":false}"""
+        }
+    } else {
+        if (settings.showPageIndicator == true) {
+            out << """{"page":${page},"id":200,"obj":"label","x":424,"y":4,"w":54,"h":22,"bg_color":"#000000","bg_opa":180,"border_width":0,"radius":4,"text":"1/1","text_font":16,"text_color":"white","align":"center","click":false}"""
+        } else {
+            out << """{"page":${page},"id":200,"obj":"label","x":0,"y":0,"w":1,"h":1,"bg_opa":0,"border_width":0,"text":"","text_font":8,"click":false}"""
+        }
+        out << """{"page":${page},"id":201,"obj":"label","x":0,"y":0,"w":1,"h":1,"bg_opa":0,"border_width":0,"text":"","text_font":8,"click":false}"""
+        out << """{"page":${page},"id":202,"obj":"label","x":0,"y":0,"w":1,"h":1,"bg_opa":0,"border_width":0,"text":"","text_font":8,"click":false}"""
+    }
+    return out
+}
+
+// Fixed 2x2 thermostat layout: slot1=display, 2=+, 3=-, 4=mode
+private List<String> layoutThermostat(int page) {
+    List<String> out = []
+    [[1,2,2,236,236],[2,242,2,236,236],[3,2,242,236,236],[4,242,242,236,236]].each { r ->
+        int sid = r[0]; int x = r[1]; int y = r[2]; int w = r[3]; int h = r[4]
+        int tf = (sid == 1) ? 32 : 56
+        boolean clickable = (sid > 1)
+        out << """{"page":${page},"id":${sid},"obj":"btn","x":${x},"y":${y},"w":${w},"h":${h},"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":${tf},"align":"center","text_color":"white","toggle":false,"click":${clickable}}"""
+    }
+    return out
+}
+
+private List<String> layout1x1(int page) {[
+    """{"page":${page},"id":1,"obj":"btn","x":2,"y":2,"w":476,"h":476,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":32,"align":"center","text_color":"white","toggle":false,"click":false}""",
+    """{"page":${page},"id":51,"obj":"label","parentid":0,"x":8,"y":8,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":32,"text_color":"white","click":false}"""
+]}
+
+private List<String> layout2x2(int page) {
+    List<String> out = []
+    [[1,2,2,236,236],[2,242,2,236,236],[3,2,242,236,236],[4,242,242,236,236]].each { r ->
+        out << """{"page":${page},"id":${r[0]},"obj":"btn","x":${r[1]},"y":${r[2]},"w":${r[3]},"h":${r[4]},"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":32,"align":"center","text_color":"white","toggle":false,"click":false}"""
+    }
+    [[51,8,8],[52,248,8],[53,8,248],[54,248,248]].each { r ->
+        out << """{"page":${page},"id":${r[0]},"obj":"label","parentid":0,"x":${r[1]},"y":${r[2]},"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":32,"text_color":"white","click":false}"""
+    }
+    return out
+}
+
+private List<String> layout3x3(int page) {
+    List<String> out = []
+    int[][] cells = [[2,2,157,157],[161,2,157,157],[320,2,158,157],[2,161,157,157],[161,161,157,157],[320,161,158,157],[2,320,157,158],[161,320,157,158],[320,320,158,158]]
+    cells.eachWithIndex { c, i ->
+        out << """{"page":${page},"id":${i+1},"obj":"btn","x":${c[0]},"y":${c[1]},"w":${c[2]},"h":${c[3]},"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"white","toggle":false,"click":false}"""
+    }
+    int[][] icons = [[8,8],[167,8],[326,8],[8,167],[167,167],[326,167],[8,326],[167,326],[326,326]]
+    icons.eachWithIndex { c, i ->
+        out << """{"page":${page},"id":${i+51},"obj":"label","parentid":0,"x":${c[0]},"y":${c[1]},"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"white","click":false}"""
+    }
+    return out
+}
+
+private List<String> layout4x4(int page) {
+    List<String> out = []; int cols = 4; int w = 117; int gap = 2
+    (0..<cols).each { row -> (0..<cols).each { col ->
+        int id = row*cols+col+1; int x = col*(w+gap)+gap; int y = row*(w+gap)+gap
+        int tw = (col==cols-1) ? (480-x-gap) : w; int th = (row==cols-1) ? (480-y-gap) : w
+        out << """{"page":${page},"id":${id},"obj":"btn","x":${x},"y":${y},"w":${tw},"h":${th},"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"white","toggle":false,"click":false}"""
+    }}
+    int id2 = 51
+    (0..<cols).each { row -> (0..<cols).each { col ->
+        int x = col*(w+gap)+gap+4; int y = row*(w+gap)+gap+4
+        out << """{"page":${page},"id":${id2},"obj":"label","parentid":0,"x":${x},"y":${y},"w":24,"h":24,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"white","click":false}"""
+        id2++
+    }}
+    return out
+}
+
+private List<String> layoutNxN(int page, int cols, int w, int gap, int tf, int iconOff, int iconFont) {
+    List<String> out = []
+    (0..<cols).each { row -> (0..<cols).each { col ->
+        int id = row*cols+col+1; int x = col*(w+gap)+gap; int y = row*(w+gap)+gap
+        int tw = (col==cols-1) ? (480-x-gap) : w; int th = (row==cols-1) ? (480-y-gap) : w
+        out << """{"page":${page},"id":${id},"obj":"btn","x":${x},"y":${y},"w":${tw},"h":${th},"bg_color":"#000000","border_color":"black","border_width":1,"radius":4,"text":"","text_font":${tf},"align":"center","text_color":"white","toggle":false,"click":false}"""
+    }}
+    int id2 = 51
+    (0..<cols).each { row -> (0..<cols).each { col ->
+        int x = col*(w+gap)+gap+iconOff; int y = row*(w+gap)+gap+iconOff
+        out << """{"page":${page},"id":${id2},"obj":"label","parentid":0,"x":${x},"y":${y},"w":${iconFont},"h":${iconFont},"bg_opa":0,"border_width":0,"text":"","text_font":${iconFont},"text_color":"white","click":false}"""
+        id2++
+    }}
+    return out
+}
+
+// ── Page slot state commands ───────────────────────────────────────────────────
+
+def setPage1MotionActive(n)   { int i = n as int; if (i>=1 && i<=maxSensors(1)) setMotionActiveForPage(1,i) }
+def setPage1MotionInactive(n) { int i = n as int; if (i>=1 && i<=maxSensors(1)) setMotionInactiveForPage(1,i) }
+def setPage1SlotEmpty(n)      { int i = n as int; if (i>=1 && i<=maxSensors(1)) setSlotEmptyForPage(1,i) }
+def setPage2MotionActive(n)   { int i = n as int; if (i>=1 && i<=maxSensors(2)) setMotionActiveForPage(2,i) }
+def setPage2MotionInactive(n) { int i = n as int; if (i>=1 && i<=maxSensors(2)) setMotionInactiveForPage(2,i) }
+def setPage2SlotEmpty(n)      { int i = n as int; if (i>=1 && i<=maxSensors(2)) setSlotEmptyForPage(2,i) }
+def setPage3MotionActive(n)   { int i = n as int; if (i>=1 && i<=maxSensors(3)) setMotionActiveForPage(3,i) }
+def setPage3MotionInactive(n) { int i = n as int; if (i>=1 && i<=maxSensors(3)) setMotionInactiveForPage(3,i) }
+def setPage3SlotEmpty(n)      { int i = n as int; if (i>=1 && i<=maxSensors(3)) setSlotEmptyForPage(3,i) }
+def setPage4MotionActive(n)   { int i = n as int; if (i>=1 && i<=maxSensors(4)) setMotionActiveForPage(4,i) }
+def setPage4MotionInactive(n) { int i = n as int; if (i>=1 && i<=maxSensors(4)) setMotionInactiveForPage(4,i) }
+def setPage4SlotEmpty(n)      { int i = n as int; if (i>=1 && i<=maxSensors(4)) setSlotEmptyForPage(4,i) }
+def setPage5MotionActive(n)   { int i = n as int; if (i>=1 && i<=maxSensors(5)) setMotionActiveForPage(5,i) }
+def setPage5MotionInactive(n) { int i = n as int; if (i>=1 && i<=maxSensors(5)) setMotionInactiveForPage(5,i) }
+def setPage5SlotEmpty(n)      { int i = n as int; if (i>=1 && i<=maxSensors(5)) setSlotEmptyForPage(5,i) }
+def setPage6MotionActive(n)   { int i = n as int; if (i>=1 && i<=maxSensors(6)) setMotionActiveForPage(6,i) }
+def setPage6MotionInactive(n) { int i = n as int; if (i>=1 && i<=maxSensors(6)) setMotionInactiveForPage(6,i) }
+def setPage6SlotEmpty(n)      { int i = n as int; if (i>=1 && i<=maxSensors(6)) setSlotEmptyForPage(6,i) }
+
+private void setMotionActiveForPage(int page, int idx) {
+    state[stateKey(page, idx)] = "active"
+    unschedule("p${page}fadeStep${idx}")
+    state.remove("p${page}fadeStep${idx}")
+
+    String sType = state[typeKey(page, idx)] ?: state["pageType${page}"] ?: "motion"
+    debugLog "[AutoPages] Active p${page}s${idx} type=${sType}"
+    if (sType == "light") {
+        String lc         = settings.colorLightActive ?: "#FFFF00"
+        String grid       = activeGrid(page)
+        int    tileFont   = tileFontFor(grid)
+        String lbl        = state[labelKey(page, idx)] ?: ""
+        String clickJsonl = buildLightTileJsonl(page, idx, grid, tileFont, lc, lbl)
+        if (clickJsonl) {
+            String node = settings.haspNode ?: "plate"
+            safePub("hasp/${node}/command/jsonl", clickJsonl)
+        }
+        publishIcon(page, idx, ICON_LIGHTBULB_ON())
+        return
+    }
+
+    String ac = settings.colorActive ?: "#FF0000"
+    publishColor(page, idx, ac)
+    publishTextColor(page, idx, ac)
+    publishIcon(page, idx, activeIconFor(page, idx), ac)
+
+    if (!state.suppressNavigation) {
+        // Only stop rotation and jump to page when sensor goes active mid-session
+        unschedule("rotatePage")
+        String node = settings.haspNode ?: "plate"
+        safePub("hasp/${node}/command/page", "${page}")
+    }
+    // If suppressNavigation is true we are in post-push sync -- don't kill the rotation timer
+
+    if (settings.backlightOnMotion) {
+        unschedule("backlightOff")
+        unschedule("motionTimeoutBacklightOff")
+        state.screenIdle = false
+        publishBacklight(true)
+        int mins = (settings.motionBacklightTimeout ?: 1) as int
+        if (mins > 0) runIn(mins * 60, "motionTimeoutBacklightOff")
+    }
+}
+
+private void setMotionInactiveForPage(int page, int idx) {
+    String fadeKey  = "p${page}fadeStep${idx}"
+    boolean wasActive = (state[stateKey(page, idx)] == "active")
+    state[stateKey(page, idx)] = "inactive"
+
+    String sType = state[typeKey(page, idx)] ?: state["pageType${page}"] ?: "motion"
+    debugLog "[AutoPages] Inactive p${page}s${idx} type=${sType} wasActive=${wasActive}"
+    if (sType == "light") {
+        unschedule(fadeKey); state.remove(fadeKey)
+        String ic         = inactiveColorFor(page, idx)
+        String grid       = activeGrid(page)
+        int    tileFont   = tileFontFor(grid)
+        String lbl        = state[labelKey(page, idx)] ?: ""
+        String clickJsonl = buildLightTileJsonl(page, idx, grid, tileFont, ic, lbl)
+        if (clickJsonl) {
+            String node = settings.haspNode ?: "plate"
+            safePub("hasp/${node}/command/jsonl", clickJsonl)
+        }
+        publishIcon(page, idx, ICON_LIGHTBULB_OFF())
+        return
+    }
+
+    String sTypeForFade = state[typeKey(page, idx)] ?: state["pageType${page}"] ?: "motion"
+    if (wasActive) {
+        unschedule(fadeKey); state[fadeKey] = 0
+        publishIcon(page, idx, inactiveIconFor(page, idx), inactiveColorFor(page, idx))
+        scheduleFadeStep(page, idx)
+        if (settings.backlightOnMotion) {
+            unschedule("motionTimeoutBacklightOff")
+            if (!allInactive()) {
+                int mins = (settings.motionBacklightTimeout ?: 1) as int
+                if (mins > 0) runIn(mins * 60, "motionTimeoutBacklightOff")
+            } else {
+                runIn((FADE_STEPS + 1) * fadeInterval() + 2, "backlightOnAfterFade")
+            }
+        }
+    } else {
+        String ic = inactiveColorFor(page, idx)
+        publishColor(page, idx, ic)
+        publishTextColor(page, idx, ic)
+        publishIcon(page, idx, inactiveIconFor(page, idx), ic)
+        if (settings.backlightOnMotion && allInactive()) {
+            int delay = (settings.backlightOffDelay ?: 0) as int
+            if (delay > 0) { unschedule("backlightOff"); runIn(delay, "backlightOff") }
+        }
+    }
+    // If all sensors are now inactive and rotation was stopped, restart it
+    if (allInactive() && !state.suppressNavigation && !state.pushInProgress) {
+        maybeRestartRotation()
+    }
+}
+
+private void setSlotEmptyForPage(int page, int idx) {
+    String fadeKey = "p${page}fadeStep${idx}"
+    state[stateKey(page, idx)] = "empty"
+    unschedule(fadeKey); state.remove(fadeKey)
+    publishColor(page, idx, "#708090")
+    publishTextColor(page, idx, "#708090")
+    publishIcon(page, idx, "")
+    String node = settings.haspNode ?: "plate"
+    safePub("hasp/${node}/command/p${page}b${bgId(idx)}.text", "")
+    safePub("hasp/${node}/command/p${page}b${iconId(idx)}.text", "")
+}
+
+// ── Label / type updates ───────────────────────────────────────────────────────
+
+def updatePage1Labels(labels)    { applyLabels(labels, 1) }
+def updatePage2Labels(labels)    { applyLabels(labels, 2) }
+def updatePage3Labels(labels)    { applyLabels(labels, 3) }
+def updatePage4Labels(labels)    { applyLabels(labels, 4) }
+def updatePage5Labels(labels)    { applyLabels(labels, 5) }
+def updatePage6Labels(labels)    { applyLabels(labels, 6) }
+def updatePage1SlotTypes(types)  { applySlotTypes(types, 1) }
+def updatePage2SlotTypes(types)  { applySlotTypes(types, 2) }
+def updatePage3SlotTypes(types)  { applySlotTypes(types, 3) }
+def updatePage4SlotTypes(types)  { applySlotTypes(types, 4) }
+def updatePage5SlotTypes(types)  { applySlotTypes(types, 5) }
+def updatePage6SlotTypes(types)  { applySlotTypes(types, 6) }
+
+private void applyLabels(labels, int page) {
+    if (!(labels instanceof Map)) {
+        try { labels = new groovy.json.JsonSlurper().parseText(labels.toString()) }
+        catch (Exception e) { infoLog "[AutoPages] WARN -- bad labels JSON: ${e.message}"; return }
+    }
+
+    // Store labels in state only -- pushPageLayout publishes them at the right time,
+    // after the layout objects exist on the display. Publishing here would race ahead
+    // of clearpage/layout JSONL and hit "Unknown object" errors.
+    labels.each { k, v ->
+        int    idx = (k as String).toInteger()
+        if (idx < 1 || idx > 49) return
+        state[labelKey(page, idx)] = v?.toString() ?: ""
+    }
+    infoLog "[AutoPages] Labels stored for page ${page}: ${labels.size()} entries"
+}
+
+private void applySlotTypes(slotTypes, int page) {
+    if (!(slotTypes instanceof Map)) {
+        try { slotTypes = new groovy.json.JsonSlurper().parseText(slotTypes.toString()) }
+        catch (Exception e) { infoLog "[AutoPages] WARN -- bad slotTypes JSON: ${e.message}"; return }
+    }
+    Map typeCounts = [:]
+    slotTypes.each { k, v ->
+        int idx = (k as String).toInteger()
+        if (idx < 1 || idx > 49) return
+        String t = (v?.toString() ?: "none")
+        state[typeKey(page, idx)] = t
+        if (t != "none") typeCounts[t] = ((typeCounts[t] ?: 0) as int) + 1
+    }
+    if (typeCounts) {
+        String dominant = typeCounts.max { it.value }.key
+        state["pageType${page}"] = dominant
+        infoLog "[AutoPages] Page ${page} type: ${dominant}"
+    }
+}
+
+// ── Light tile helper ──────────────────────────────────────────────────────────
+
+// tileFont is passed in so this method never guesses -- it always matches the layout.
+private String buildLightTileJsonl(int page, int slot, String grid, int tileFont, String bgColor = "#000000", String label = "") {
+    int col0, row0, tw, th
+    switch (grid) {
+        case "1x1":
+            col0=2; row0=2; tw=476; th=476; break
+        case "2x2":
+            int[][] c2 = [[2,2,236,236],[242,2,236,236],[2,242,236,236],[242,242,236,236]]
+            if (slot<1||slot>4) return null
+            col0=c2[slot-1][0]; row0=c2[slot-1][1]; tw=c2[slot-1][2]; th=c2[slot-1][3]; break
+        default:
+            // Match layoutNxN geometry exactly: gap=2 for 3x3/4x4, gap=1 for 5x5+
+            int n = gridNFor(grid)
+            if (n < 1) return null
+            int gap
+            int w
+            switch (grid) {
+                case "3x3": gap=4; w=157; break
+                case "4x4": gap=2; w=117; break
+                case "5x5": gap=2; w=94;  break
+                case "6x6": gap=2; w=78;  break
+                case "7x7": gap=1; w=67;  break
+                default:    gap=2; w=(int)Math.floor((480-(n+1)*2)/n); break
+            }
+            int col  = (slot-1) % n
+            int row  = (int)Math.floor((slot-1) / n)
+            col0 = col * (w + gap) + gap
+            row0 = row * (w + gap) + gap
+            tw   = (col == n-1) ? (480 - col0 - gap) : w
+            th   = (row == n-1) ? (480 - row0 - gap) : w
+            break
+    }
+    String escapedLabel = label.replace('"', '\\"').replace('\n', '\\n')
+    String contrast = contrastColor(bgColor)
+    return """{"page":${page},"id":${bgId(slot)},"obj":"btn","x":${col0},"y":${row0},"w":${tw},"h":${th},"bg_color":"${bgColor}","border_color":"black","border_width":4,"radius":10,"text":"${escapedLabel}","text_font":${tileFont},"align":"center","text_color":"${contrast}","toggle":false,"click":true}"""
+}
+
+// ── Rotation ───────────────────────────────────────────────────────────────────
+
+def rotatePage() {
+    if (state.pushInProgress) return
+    int total = (state.numberOfPages ?: 1) as int
+    if (total < 2) return
+    int cur  = (state.rotationPage ?: 1) as int
+    int next = (cur % total) + 1
+    state.rotationPage = next
+    String node = settings.haspNode ?: "plate"
+    safePub("hasp/${node}/command/page", "${next}")
+    int rotInt = (settings.rotationInterval ?: 0) as int
+    if (rotInt > 0) runIn(rotInt, "rotatePage")
+}
+
+// ── Fade engine ────────────────────────────────────────────────────────────────
+
+@Field static final int FADE_STEPS = 10
+
+private int fadeInterval() {
+    int dur = (settings.fadeDuration ?: 30) as int
+    return Math.max(1, (int)(dur / FADE_STEPS))
+}
+
+private void scheduleFadeStep(int page, int idx) {
+    int interval = fadeInterval()
+    switch ("${page}_${idx}") {
+        // Hubitat requires literal method names for runIn, so we encode page+slot in method name.
+        // We support up to page 6, slot 49. Schedules fire fadeContinue which reads state.
+        default:
+            // Generic path: store page+idx for the single shared handler approach
+            state["fadeTarget_${page}_${idx}"] = true
+            runIn(interval, "fadeContinueAll")
+            break
+    }
+}
+
+def fadeContinueAll() {
+    // Find all in-progress fades and advance them
+    int numPg = (state.numberOfPages ?: 6) as int
+    boolean anyRemaining = false
+    (1..numPg).each { pg ->
+        (1..maxSensors(pg)).each { idx ->
+            String fadeKey = "p${pg}fadeStep${idx}"
+            def stepObj = state[fadeKey]
+            if (stepObj == null) return
+            int step = (stepObj as int) + 1
+            if (step >= FADE_STEPS) {
+                state.remove(fadeKey)
+                state.remove("fadeTarget_${pg}_${idx}")
+                String ic = inactiveColorFor(pg, idx)
+                publishColor(pg, idx, ic)
+                publishTextColor(pg, idx, ic)
+            } else {
+                state[fadeKey] = step
+                anyRemaining = true
+                // Interpolate from active red to inactive color
+                String ic    = inactiveColorFor(pg, idx)
+                String color = interpolateColor("#FF0000", ic, step, FADE_STEPS)
+                publishColor(pg, idx, color)
+                publishTextColor(pg, idx, color)
+            }
+        }
+    }
+    if (anyRemaining) runIn(fadeInterval(), "fadeContinueAll")
+}
+
+private String interpolateColor(String from, String to, int step, int total) {
+    try {
+        int r1 = Integer.parseInt(from.substring(1,3), 16)
+        int g1 = Integer.parseInt(from.substring(3,5), 16)
+        int b1 = Integer.parseInt(from.substring(5,7), 16)
+        int r2 = Integer.parseInt(to.substring(1,3), 16)
+        int g2 = Integer.parseInt(to.substring(3,5), 16)
+        int b2 = Integer.parseInt(to.substring(5,7), 16)
+        float t  = (float)step / total
+        int r    = (int)(r1 + (r2-r1)*t)
+        int g    = (int)(g1 + (g2-g1)*t)
+        int b    = (int)(b1 + (b2-b1)*t)
+        return String.format("#%02X%02X%02X", r, g, b)
+    } catch (Exception e) {
+        return to
+    }
+}
+
+// ── Publish helpers ────────────────────────────────────────────────────────────
+
+private void publishColor(int page, int idx, String color) {
+    String node     = settings.haspNode ?: "plate"
+    String contrast = contrastColor(color)
+    // Single JSONL updates bg_color and text_color atomically -- no render between them
+    String jsonl = '{"page":' + page + ',"id":' + bgId(idx) + ',"bg_color":"' + color + '","text_color":"' + contrast + '"}' 
+    safePub("hasp/" + node + "/command/jsonl", jsonl)
+}
+
+private void publishTextColor(int page, int idx, String color) {
+    // No-op: publishColor now handles both btn and icon text colors together.
+    // Kept for call-site compatibility.
+}
+
+private void publishIcon(int page, int idx, String icon, String bgColor = null) {
+    publishIconJsonl(settings.haspNode ?: "plate", page, idx, icon, bgColor)
+}
+
+// Send icon via JSONL so non-ASCII chars survive Hubitat MQTT stripping.
+// Optionally pass bgColor to set text_color contrast at the same time.
+private void publishIconJsonl(String node, int page, int idx, String icon, String bgColor = null) {
+    try {
+        String escaped = iconToJsonEscape(icon)
+        String jsonl = '{"page":' + page + ',"id":' + iconId(idx) + ',"text":"' + escaped + '"'
+        if (bgColor) jsonl += ',"text_color":"' + contrastColor(bgColor) + '"'
+        jsonl += '}'
+        debugLog "[AutoPages] Icon JSONL p${page}s${idx}: ${jsonl}"
+        safePub("hasp/" + node + "/command/jsonl", jsonl)
+    } catch (Exception e) {
+        infoLog "[AutoPages] WARN -- publishIconJsonl p${page}s${idx}: ${e.message}"
+    }
+}
+
+// Return the pre-computed JSON \\uXXXX escape for known icon glyphs.
+// Avoids String.format and Integer.toHexString which are not available in Hubitat sandbox.
+private String iconToJsonEscape(String s) {
+    if (!s) return ""
+    // Fast path: single-character icons from our known set
+    if (s.length() == 1) {
+        switch (s) {
+            case "\uE70E": return "\\uE70E"   // run
+            case "\uE004": return "\\uE004"   // account
+            case "\uE026": return "\\uE026"   // alert
+            case "\uE238": return "\\uE238"   // fire
+            case "\uE58C": return "\\uE58C"   // water
+            case "\uE58E": return "\\uE58E"   // water-percent
+            case "\uE2DC": return "\\uE2DC"   // home
+            case "\uE6A1": return "\\uE6A1"   // home-outline
+            case "\uE6E8": return "\\uE6E8"   // lightbulb-on
+            case "\uE335": return "\\uE335"   // lightbulb
+            case "\uE415": return "\\uE415"   // plus
+            case "\uE374": return "\\uE374"   // minus
+        }
+    }
+    // Fallback: pass ASCII strings through unchanged, drop unknowns
+    boolean allAscii = true
+    for (int i = 0; i < s.length(); i++) {
+        if ((int) s.charAt(i) > 127) { allAscii = false; break }
+    }
+    return allAscii ? s : ""
+}
+
+// Returns black or white depending on which contrasts better with the given hex color.
+private String contrastColor(String hex) {
+    try {
+        String h = hex.startsWith("#") ? hex.substring(1) : hex
+        int r = Integer.parseInt(h.substring(0,2), 16)
+        int g = Integer.parseInt(h.substring(2,4), 16)
+        int b = Integer.parseInt(h.substring(4,6), 16)
+        // Perceived luminance (WCAG formula)
+        double lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        return (lum > 0.55) ? "#000000" : "#FFFFFF"
+    } catch (Exception e) {
+        return "#FFFFFF"
+    }
+}
+
+private void publishJsonl(String node, int page, int objId, Map props) {
+    def obj = [page: page, id: objId] + props
+    String json = groovy.json.JsonOutput.toJson(obj)
+    safePub("hasp/${node}/command/jsonl", json)
+}
+
+// ── Icon constants ─────────────────────────────────────────────────────────────
+
+// Icon glyphs -- codes from official openHASP 0.7 font table:
+// https://www.openhasp.com/0.7.0/design/fonts/
+private String ICON_MOTION_ACTIVE()   { return "\uE70E" }   // run
+private String ICON_MOTION_INACTIVE() { return "\uE004" }   // account
+private String ICON_SMOKE_ACTIVE()    { return "\uE026" }   // alert
+private String ICON_SMOKE_INACTIVE()  { return "\uE238" }   // fire
+private String ICON_WATER_ACTIVE()    { return "\uE58C" }   // water
+private String ICON_WATER_INACTIVE()  { return "\uE58E" }   // water-percent
+private String ICON_CONTACT_OPEN()    { return "\uE2DC" }   // home (contact open/active)
+private String ICON_CONTACT_CLOSED()  { return "\uE6A1" }   // home-outline (contact closed)
+private String ICON_LIGHTBULB_ON()    { return "\uE6E8" }   // lightbulb-on
+private String ICON_LIGHTBULB_OFF()   { return "\uE335" }   // lightbulb
+
+private String activeIconFor(int page, int idx) {
+    String t = state[typeKey(page, idx)] ?: state["pageType${page}"] ?: "motion"
+    switch (t) {
+        case "smoke":   return ICON_SMOKE_ACTIVE()
+        case "water":   return ICON_WATER_ACTIVE()
+        case "contact": return ICON_CONTACT_OPEN()
+        default:        return ICON_MOTION_ACTIVE()
+    }
+}
+
+private String inactiveIconFor(int page, int idx) {
+    String t = state[typeKey(page, idx)] ?: state["pageType${page}"] ?: "motion"
+    switch (t) {
+        case "smoke":   return ICON_SMOKE_INACTIVE()
+        case "water":   return ICON_WATER_INACTIVE()
+        case "contact": return ICON_CONTACT_CLOSED()
+        case "light":   return ICON_LIGHTBULB_OFF()
+        default:        return ICON_MOTION_INACTIVE()
+    }
+}
+
+private String inactiveColorFor(int page, int idx) {
+    String t = state[typeKey(page, idx)] ?: state["pageType${page}"] ?: "motion"
+    switch (t) {
+        case "contact": return (settings.colorContactInactive ?: "#00FFFF")
+        case "water":   return (settings.colorWaterInactive   ?: "#0000FF")
+        case "smoke":   return (settings.colorSmokeInactive   ?: "#808080")
+        case "light":   return (settings.colorLightInactive   ?: "#808080")
+        default:        return (settings.colorInactive        ?: "#008000")
+    }
+}
+
+// ── Grid helpers ───────────────────────────────────────────────────────────────
+
+private int gridNFor(String grid) {
+    switch (grid) {
+        case "1x1": return 1
+        case "2x2": return 2
+        case "3x3": return 3
+        case "4x4": return 4
+        case "5x5": return 5
+        case "6x6": return 6
+        case "7x7": return 7
+        default:    return 2
+    }
 }
 
 private int maxCharsForGrid(int n) {
@@ -1068,37 +1444,7 @@ private int maxCharsForGrid(int n) {
     }
 }
 
-private String stripEmoji(String text) {
-    if (!text) return ""
-    return text.replaceAll(/[^\x20-\x7E]/, "").replaceAll(/\s+/, " ").trim()
-}
-
-private List sortDevicesByName(List devices) {
-    if (!devices) return []
-    return devices.findAll { it != null }
-        .sort { a, b -> stripEmoji(a.displayName ?: "").compareToIgnoreCase(stripEmoji(b.displayName ?: "")) }
-}
-
-private String wrapLabel(String text, int maxChars) {
-    if (!text || text.length() <= maxChars) return text ?: ""
-    List<String> words = text.split(" ") as List
-    List<String> lines = []
-    String current = ""
-    words.each { word ->
-        if (current.isEmpty()) {
-            current = word
-        } else if ((current + " " + word).length() <= maxChars) {
-            current += " " + word
-        } else {
-            lines << current
-            current = word
-        }
-    }
-    if (current) lines << current
-    return lines.join("\n")
-}
-
-// ── Logging ───────────────────────────────────────────────────────────────────
+// ── Logging ────────────────────────────────────────────────────────────────────
 
 private void infoLog(String msg) {
     if ((settings.logLevel ?: "1") != "0") log.info msg
